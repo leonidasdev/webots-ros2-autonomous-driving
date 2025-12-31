@@ -57,14 +57,8 @@ class SignDetector(Node):
         try:
             package_share_dir = get_package_share_directory('car_pkg')
             
-            # Intentar cargar de resources_augmented o resources normal
-            augmented_path = os.path.join(package_share_dir, 'resources_augmented')
-            normal_path = os.path.join(package_share_dir, 'resources')
-            
-            if os.path.exists(augmented_path):
-                target_path = augmented_path
-            else:
-                target_path = normal_path
+            # Cargar desde el directorio `resources` en el paquete
+            target_path = os.path.join(package_share_dir, 'resources')
             
             # Fallback al directorio actual
             if not os.path.exists(target_path):

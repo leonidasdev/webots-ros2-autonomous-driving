@@ -17,10 +17,6 @@ setup(
         (os.path.join('share', package_name, 'resources'), 
          glob('resources/*.png') + glob('resources/*.jpg') + glob('resources/*.jpeg')),
         
-        # Recursos AUMENTADOS (NUEVO - para mejor detección)
-        (os.path.join('share', package_name, 'resources_augmented'), 
-         glob('resources_augmented/*.png') + glob('resources_augmented/*.jpg') + glob('resources_augmented/*.jpeg')),
-        
         # Archivos de lanzamiento
         (os.path.join('share', package_name, 'launch'), 
          glob('launch/*.launch.py') + glob('launch/*.py')),

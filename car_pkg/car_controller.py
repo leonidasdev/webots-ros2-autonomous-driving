@@ -14,7 +14,7 @@ class CarController(Node):
         self.current_speed = self.base_speed
         self.max_speed = self.base_speed
         
-        self.speed_conversion_factor = 1.0
+        self.speed_conversion_factor = 0.5
         
         # Estado de control
         self.steering = 0.0
@@ -40,8 +40,16 @@ class CarController(Node):
         self.speed_pub = self.create_publisher(Float32, '/control/speed', 10)
         self.steering_pub = self.create_publisher(Float32, '/control/steering', 10)
         
-        # Timer para loop de control
-        self.timer = self.create_timer(0.05, self.control_loop)
+        # Timer para loop de control (hacerlo 5x más rápido que antes)
+        # Antes: 0.05s (20 Hz). Ahora: 0.01s (100 Hz) para reaccionar con más rapidez.
+        self.control_dt = 0.01
+        self.timer = self.create_timer(self.control_dt, self.control_loop)
+
+        # Ajuste de velocidad por tick: mantenemos la misma aceleración por segundo
+        # que antes (1.0 por 0.05s => 20.0 unidades/s). Calculamos el paso por tick
+        # en base al nuevo `control_dt`.
+        self._speed_step_per_sec = 1.0 / 0.05
+        self.speed_step = self._speed_step_per_sec * self.control_dt
         
         self.get_logger().info("Car Controller iniciado")
         
@@ -53,16 +61,22 @@ class CarController(Node):
         """Procesa señales de tráfico del sign_detector"""
         current_time = time.time()
         sign_data = msg.data
-        
-        # Verificar cooldown
+        # Verificar cooldown: allow processing if the sign is different (override)
         if current_time - self.last_sign_time < self.sign_cooldown:
-            return
-        
-        # Solo procesar si es una señal nueva
+            if sign_data == self.last_sign:
+                return
+
+        # Procesar si es una señal nueva o diferente
         if sign_data != self.last_sign:
             self.last_sign = sign_data
             self.last_sign_time = current_time
-            
+
+            # Override yield: enable only if the new sign is a yield, otherwise disable
+            if sign_data.startswith('yield'):
+                self.yield_speed_active = True
+            else:
+                self.yield_speed_active = False
+
             # Procesar la señal según tipo
             self.handle_traffic_sign()
             
@@ -150,9 +164,9 @@ class CarController(Node):
         if not self.is_stopped:
             # Ajuste gradual de velocidad hacia max_speed
             if self.current_speed > self.max_speed:
-                self.current_speed = max(self.max_speed, self.current_speed - 1.0)
+                self.current_speed = max(self.max_speed, self.current_speed - self.speed_step)
             elif self.current_speed < self.max_speed:
-                self.current_speed = min(self.max_speed, self.current_speed + 1.0)
+                self.current_speed = min(self.max_speed, self.current_speed + self.speed_step)
             
             # Publicar velocidad
             speed_msg = Float32()

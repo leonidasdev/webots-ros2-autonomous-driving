@@ -79,7 +79,7 @@ class WebotsBridge(Node):
         self.get_logger().info("Webots Bridge listo!")
         
     def speed_callback(self, msg):
-        self.current_speed = max(0.0, min(msg.data, 10.0))
+        self.current_speed = max(0.0, min(msg.data, 100.0))
         # Aplicar velocidad solo a las ruedas traseras
         self.motors['right_rear_wheel'].setVelocity(self.current_speed)
         self.motors['left_rear_wheel'].setVelocity(self.current_speed)
