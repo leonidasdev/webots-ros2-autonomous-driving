@@ -100,6 +100,20 @@ class SignDetector(Node):
 
                         h, w = template_gray.shape[:2]
 
+                        # Upscale very small templates to a minimum reference size
+                        max_dim = max(h, w)
+                        MIN_TEMPLATE_DIM = 48
+                        if max_dim < MIN_TEMPLATE_DIM:
+                            scale = int(np.ceil(MIN_TEMPLATE_DIM / float(max_dim)))
+                            new_w = max(8, int(w * scale))
+                            new_h = max(8, int(h * scale))
+                            try:
+                                template_gray = cv2.resize(template_gray, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                                template_bgr = cv2.resize(template_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                                h, w = template_gray.shape[:2]
+                            except Exception:
+                                pass
+
                         if sign_type == 'speed_limit' and speed_value:
                             template_key = f"speed_limit_{speed_value}_{filename}"
                         else:
@@ -229,6 +243,35 @@ class SignDetector(Node):
                         # If the lowest vertex is not clearly below centroid, penalize
                         if (np.max(ys) - centroid_y) < (h * 0.10):
                             yield_score -= 0.35
+                    except Exception:
+                        pass
+
+                    # Penalize small, cone-like triangles (likely traffic cones)
+                    try:
+                        roi = image[y:y+h, x:x+w]
+                        if roi.size > 0:
+                            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                            # orange range for cones
+                            orange_lower = np.array([5, 80, 80])
+                            orange_upper = np.array([25, 255, 255])
+                            orange_mask = cv2.inRange(hsv_roi, orange_lower, orange_upper)
+                            orange_ratio = np.sum(orange_mask > 0) / float(max(1, w*h))
+
+                            # red mask for comparison
+                            red_lower1 = np.array([0, 40, 40])
+                            red_upper1 = np.array([20, 255, 255])
+                            red_lower2 = np.array([160, 40, 40])
+                            red_upper2 = np.array([180, 255, 255])
+                            red_mask1 = cv2.inRange(hsv_roi, red_lower1, red_upper1)
+                            red_mask2 = cv2.inRange(hsv_roi, red_lower2, red_upper2)
+                            red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+                            red_ratio = np.sum(red_mask > 0) / float(max(1, w*h))
+
+                            # If the patch is dominated by orange (cone) or very small, heavily penalize
+                            if orange_ratio > 0.05 and orange_ratio > red_ratio * 0.6:
+                                yield_score -= 0.6
+                            if max(w, h) < 24:
+                                yield_score -= 0.45
                     except Exception:
                         pass
                 elif vertices in [4, 5, 6]:
@@ -387,13 +430,23 @@ class SignDetector(Node):
         """Template matching con plantillas cargadas"""
         x, y, w, h = bbox
         roi = image[y:y+h, x:x+w]
-        if roi.size == 0 or w < 8 or h < 8:
+        if roi.size == 0:
             return 0.0, None
-        
+
         if len(roi.shape) == 3:
             roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         else:
             roi_gray = roi
+
+        # Upscale very small ROIs to improve template matching / OCR
+        MIN_ROI_DIM = 64
+        roi_h, roi_w = roi_gray.shape[:2]
+        if roi_w < MIN_ROI_DIM or roi_h < MIN_ROI_DIM:
+            scale_up = max(MIN_ROI_DIM / float(roi_w), MIN_ROI_DIM / float(roi_h))
+            new_w = max(8, int(roi_w * scale_up))
+            new_h = max(8, int(roi_h * scale_up))
+            roi_gray = cv2.resize(roi_gray, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            roi_h, roi_w = new_h, new_w
         
         best_confidence = 0.0
         best_template_key = None
@@ -411,9 +464,9 @@ class SignDetector(Node):
 
             t_h, t_w = template_gray.shape[:2]
 
-            # Scale template to fit ROI if necessary
-            if t_h > h or t_w > w:
-                scale_factor = min(h / t_h, w / t_w)
+            # Scale template to fit ROI if necessary (use ROI's current size)
+            if t_h > roi_h or t_w > roi_w:
+                scale_factor = min(roi_h / float(t_h), roi_w / float(t_w))
                 new_h = max(8, int(t_h * scale_factor))
                 new_w = max(8, int(t_w * scale_factor))
                 resized_template = cv2.resize(template_gray, (new_w, new_h))
@@ -434,11 +487,30 @@ class SignDetector(Node):
 
     def image_callback(self, msg):
         """Procesa cada frame de la cámara"""
+        # Note: camera frames from Webots are 512x256 (w x h).
+        # Typical sign ROIs extracted by downstream logic are very small
+        # (about 22x27). The detector upscales tiny input frames to a
+        # MIN_WORKING_WIDTH so template matching and OCR have enough
+        # resolution to work reliably.
         try:
             current_time = time.time()
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            
-            detected_sign, confidence, debug = self.detect_sign_comprehensive(cv_image)
+            # Adaptive working width: only downscale very large frames to limit
+            # computation. Do not upscale full frames — instead we upscale tiny
+            # ROIs before template matching so small crops (e.g. 22x27) gain
+            # sufficient resolution without enlarging the whole image.
+            MAX_WORKING_WIDTH = 800
+            h_orig, w_orig = cv_image.shape[:2]
+            if w_orig > MAX_WORKING_WIDTH:
+                new_w = MAX_WORKING_WIDTH
+                scale = new_w / float(w_orig)
+                new_h = max(1, int(h_orig * scale))
+                small_img = cv2.resize(cv_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                scale = 1.0
+                small_img = cv_image
+
+            detected_sign, confidence, debug = self.detect_sign_comprehensive(small_img, original_image=cv_image, scale=scale)
             
             if detected_sign:
                 time_since_last = current_time - self.last_detection_time
@@ -469,7 +541,7 @@ class SignDetector(Node):
         except Exception as e:
             self.get_logger().error(f"Error procesando imagen: {str(e)}")
 
-    def detect_sign_comprehensive(self, image):
+    def detect_sign_comprehensive(self, image, original_image=None, scale=1.0):
         """Pipeline principal de detección de señales"""
         best_detection = None
         best_confidence = 0
@@ -502,6 +574,15 @@ class SignDetector(Node):
             total_conf = (shape_conf * weights['shape'] +
                           color_conf * weights['color'] +
                           template_conf * weights['template'])
+            # Log per-candidate confidences to diagnose why detections are suppressed
+            try:
+                self.get_logger().info(
+                    f"Candidate {sign_type} bbox={bbox} "
+                    f"shape={shape_conf:.3f} color={color_conf:.3f} "
+                    f"template={template_conf:.3f} total={total_conf:.3f}"
+                )
+            except Exception:
+                pass
             
             shape_ok = shape_conf > thresholds['shape']
             color_ok = color_conf > thresholds['color']
@@ -512,14 +593,26 @@ class SignDetector(Node):
             if shape_ok and color_ok and total_ok:
                 # For speed limits, accept only when template OR OCR confirms digits
                 if sign_type == 'speed_limit':
-                    speed_from_ocr = self.extract_speed_from_roi(image, bbox)
+                    # If original_image provided, map bbox back to original for OCR
+                    speed_from_ocr = None
+                    if original_image is not None and scale and scale != 1.0:
+                        try:
+                            x, y, w, h = bbox
+                            orig_bbox = (int(x / scale), int(y / scale), int(w / scale), int(h / scale))
+                        except Exception:
+                            orig_bbox = bbox
+                        speed_from_ocr = self.extract_speed_from_roi(original_image, orig_bbox)
+                    else:
+                        speed_from_ocr = self.extract_speed_from_roi(image, bbox)
+
                     if template_ok or speed_from_ocr:
                         best_confidence = total_conf
                         best_debug = {
                             'shape': float(shape_conf),
                             'color': float(color_conf),
                             'template': float(template_conf),
-                            'bbox': bbox,
+                            # report bbox in original-image coordinates if original_image provided
+                            'bbox': (orig_bbox if original_image is not None and scale and scale != 1.0 else bbox),
                             'type': sign_type
                         }
 
@@ -542,7 +635,7 @@ class SignDetector(Node):
                             'shape': float(shape_conf),
                             'color': float(color_conf),
                             'template': float(template_conf),
-                            'bbox': bbox,
+                            'bbox': (bbox if original_image is None or scale == 1.0 else (int(bbox[0]/scale), int(bbox[1]/scale), int(bbox[2]/scale), int(bbox[3]/scale))),
                             'type': sign_type
                         }
                         best_detection = sign_type
