@@ -11,6 +11,11 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from std_msgs.msg import String
 import time
+try:
+    import pytesseract
+    _HAS_PYTESSERACT = True
+except Exception:
+    _HAS_PYTESSERACT = False
 
 class SignDetector(Node):
     def __init__(self):
@@ -29,6 +34,10 @@ class SignDetector(Node):
         
         # Carga de plantillas
         self.base_templates = self.load_base_templates()
+
+        # Reutilizables para reducir allocs por frame
+        self.morph_kernel = np.ones((5, 5), np.uint8)
+        self.small_kernel = np.ones((3, 3), np.uint8)
         
         # Ponderaciones
         self.weights = {
@@ -41,7 +50,8 @@ class SignDetector(Node):
         self.thresholds = {
             'stop': {'shape': 0.20, 'color': 0.20, 'template': 0.20, 'total': 0.35},
             'yield': {'shape': 0.15, 'color': 0.25, 'template': 0.15, 'total': 0.35},
-            'speed_limit': {'shape': 0.15, 'color': 0.25, 'template': 0.20, 'total': 0.35}
+            # Make template threshold stricter for speed signs to reduce false positives
+            'speed_limit': {'shape': 0.15, 'color': 0.25, 'template': 0.35, 'total': 0.40}
         }
         
         # Parámetros para detección de formas
@@ -81,20 +91,70 @@ class SignDetector(Node):
                 
                 if sign_type:
                     filepath = os.path.join(target_path, filename)
-                    template = cv2.imread(filepath)
-                    
-                    if template is not None:
+                    template_bgr = cv2.imread(filepath)
+                    if template_bgr is not None:
+                        try:
+                            template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+                        except Exception:
+                            template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+
+                        h, w = template_gray.shape[:2]
+
                         if sign_type == 'speed_limit' and speed_value:
                             template_key = f"speed_limit_{speed_value}_{filename}"
-                            templates[template_key] = template
                         else:
                             template_key = f"{sign_type}_{filename}"
-                            templates[template_key] = template
+
+                        templates[template_key] = {
+                            'bgr': template_bgr,
+                            'gray': template_gray,
+                            'h': h,
+                            'w': w
+                        }
                     
         except Exception as e:
             self.get_logger().error(f"Error cargando plantillas: {str(e)}")
         
         return templates
+
+    def extract_speed_from_roi(self, image, bbox):
+        """Attempt to OCR digits from the speed-limit ROI. Returns int or None."""
+        if not _HAS_PYTESSERACT:
+            return None
+
+        x, y, w, h = bbox
+        roi = image[y:y+h, x:x+w]
+        if roi.size == 0 or w < 12 or h < 12:
+            return None
+
+        try:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            gray = roi if len(roi.shape) == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # Preprocess for OCR: resize and adaptive threshold
+        scale = max(1, int(100.0 / max(h, w)))
+        if scale > 1:
+            gray = cv2.resize(gray, (w*scale, h*scale), interpolation=cv2.INTER_LINEAR)
+
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Optional inversion if digits are dark on light
+        white_ratio = np.sum(th > 0) / (th.shape[0]*th.shape[1])
+        if white_ratio > 0.7:
+            th = cv2.bitwise_not(th)
+
+        config = '--psm 7 -c tessedit_char_whitelist=0123456789'
+        try:
+            text = pytesseract.image_to_string(th, config=config)
+            digits = re.findall(r'\d+', text)
+            if digits:
+                return int(digits[0])
+        except Exception:
+            return None
+
+        return None
     
     def determine_sign_type(self, filename):
         """Determina el tipo de señal basado en el nombre del archivo"""
@@ -122,10 +182,10 @@ class SignDetector(Node):
         gray = cv2.equalizeHist(gray)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         edges = cv2.Canny(blurred, 20, 80)
-        
-        kernel = np.ones((5,5), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=2)
-        edges = cv2.erode(edges, kernel, iterations=1)
+
+        # Reuse a preallocated kernel to avoid allocations each frame
+        edges = cv2.dilate(edges, self.morph_kernel, iterations=2)
+        edges = cv2.erode(edges, self.morph_kernel, iterations=1)
         
         # Encontrar contornos
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -142,7 +202,8 @@ class SignDetector(Node):
                 continue
             
             perimeter = cv2.arcLength(contour, True)
-            epsilon = 0.05 * perimeter
+            # Use a smaller epsilon to preserve vertices in low-res shapes
+            epsilon = 0.02 * perimeter
             approx = cv2.approxPolyDP(contour, epsilon, True)
             vertices = len(approx)
             
@@ -160,7 +221,16 @@ class SignDetector(Node):
             if (yield_params['min_vertices'] <= vertices <= yield_params['max_vertices']):
                 yield_score = 0.0
                 if vertices == 3:
+                    # Strong bonus for triangles, but check orientation (yield is inverted triangle)
                     yield_score += 0.6
+                    try:
+                        ys = approx[:, 0, 1]
+                        centroid_y = np.mean(ys)
+                        # If the lowest vertex is not clearly below centroid, penalize
+                        if (np.max(ys) - centroid_y) < (h * 0.10):
+                            yield_score -= 0.35
+                    except Exception:
+                        pass
                 elif vertices in [4, 5, 6]:
                     yield_score += 0.4
                 else:
@@ -327,40 +397,39 @@ class SignDetector(Node):
         
         best_confidence = 0.0
         best_template_key = None
-        
+
         if sign_type == 'speed_limit':
-            templates_to_try = [(k, t) for k, t in self.base_templates.items() 
-                               if 'speed_limit' in k]
+            templates_to_try = [(k, t) for k, t in self.base_templates.items() if k.startswith('speed_limit')]
         else:
-            templates_to_try = [(k, t) for k, t in self.base_templates.items() 
-                               if sign_type == k.split('_')[0]]
-        
-        for template_key, template in templates_to_try:
-            if len(template.shape) == 3:
-                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-            else:
-                template_gray = template
-            
-            if template_gray.shape[0] > h or template_gray.shape[1] > w:
-                scale_factor = min(h / template_gray.shape[0], w / template_gray.shape[1])
-                new_h = int(template_gray.shape[0] * scale_factor)
-                new_w = int(template_gray.shape[1] * scale_factor)
-                if new_h < 8 or new_w < 8:
-                    continue
+            templates_to_try = [(k, t) for k, t in self.base_templates.items() if sign_type == k.split('_')[0]]
+
+        for template_key, template_dict in templates_to_try:
+            # template_dict: {'bgr','gray','h','w'}
+            template_gray = template_dict.get('gray')
+            if template_gray is None:
+                continue
+
+            t_h, t_w = template_gray.shape[:2]
+
+            # Scale template to fit ROI if necessary
+            if t_h > h or t_w > w:
+                scale_factor = min(h / t_h, w / t_w)
+                new_h = max(8, int(t_h * scale_factor))
+                new_w = max(8, int(t_w * scale_factor))
                 resized_template = cv2.resize(template_gray, (new_w, new_h))
             else:
                 resized_template = template_gray
-            
+
             try:
                 result = cv2.matchTemplate(roi_gray, resized_template, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(result)
-                
+
                 if max_val > best_confidence:
                     best_confidence = max_val
                     best_template_key = template_key
             except Exception:
                 continue
-        
+
         return best_confidence, best_template_key
 
     def image_callback(self, msg):
@@ -369,7 +438,7 @@ class SignDetector(Node):
             current_time = time.time()
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
-            detected_sign, confidence = self.detect_sign_comprehensive(cv_image)
+            detected_sign, confidence, debug = self.detect_sign_comprehensive(cv_image)
             
             if detected_sign:
                 time_since_last = current_time - self.last_detection_time
@@ -377,7 +446,18 @@ class SignDetector(Node):
                 cooldown = self.cooldowns.get(base_sign_type, 1.0)
                 
                 if time_since_last > cooldown or detected_sign != self.last_sign_detected:
-                    self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence:.3f})")
+                    # Log detection with per-cue confidences when available
+                    if debug:
+                        s_conf = debug.get('shape', 0.0)
+                        c_conf = debug.get('color', 0.0)
+                        t_conf = debug.get('template', 0.0)
+                        bbox = debug.get('bbox')
+                        self.get_logger().info(
+                            f"Señal detectada: {detected_sign} ({confidence:.3f}) "
+                            f"shape={s_conf:.3f} color={c_conf:.3f} template={t_conf:.3f} bbox={bbox}"
+                        )
+                    else:
+                        self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence:.3f})")
                     
                     self.last_sign_detected = detected_sign
                     self.last_detection_time = current_time
@@ -393,11 +473,12 @@ class SignDetector(Node):
         """Pipeline principal de detección de señales"""
         best_detection = None
         best_confidence = 0
+        best_debug = None
         
         shapes = self.detect_shapes(image)
         
         if not shapes:
-            return None, 0
+            return None, 0, None
         
         for shape in shapes:
             sign_type, bbox = shape['type'], shape['bbox']
@@ -405,37 +486,68 @@ class SignDetector(Node):
             
             weights = self.weights.get(sign_type, {'shape': 0.5, 'color': 0.3, 'template': 0.2})
             thresholds = self.thresholds.get(sign_type, {'shape': 0.15, 'color': 0.2, 'template': 0.15, 'total': 0.35})
-            
+            # Primero obtener la confianza por color (rápida) y decidir si
+            # merece la pena ejecutar la coincidencia de plantilla (costosa).
             color_conf = self.verify_with_color(image, bbox, sign_type)
-            template_conf, template_key = self.verify_with_template(image, bbox, sign_type)
-            
-            total_conf = (shape_conf * weights['shape'] + 
-                         color_conf * weights['color'] + 
-                         template_conf * weights['template'])
+
+            template_conf = 0.0
+            template_key = None
+
+            # Ejecutar template-matching sólo si la forma y el color son razonablemente buenos
+            # (esto evita lanzar coincidencias de plantilla en objetos blancos/rojos imprecisos)
+            if (shape_conf > thresholds['shape'] and color_conf > thresholds['color']) \
+               or (shape_conf >= thresholds['shape'] * 2.0):
+                template_conf, template_key = self.verify_with_template(image, bbox, sign_type)
+
+            total_conf = (shape_conf * weights['shape'] +
+                          color_conf * weights['color'] +
+                          template_conf * weights['template'])
             
             shape_ok = shape_conf > thresholds['shape']
             color_ok = color_conf > thresholds['color']
             template_ok = template_conf > thresholds['template']
             total_ok = total_conf > thresholds['total'] and total_conf > best_confidence
             
-            if shape_ok and total_ok:
-                if shape_conf > 0.4 and color_conf > thresholds['color'] * 0.7:
-                    color_ok = True
-                
-                if shape_ok and color_ok and template_ok and total_ok:
-                    best_confidence = total_conf
-                    
-                    if sign_type == 'speed_limit' and template_key and 'speed_limit' in template_key:
-                        parts = template_key.split('_')
-                        if len(parts) >= 3:
-                            speed_num = parts[2]
-                            best_detection = f"speed_limit_{speed_num}"
+            # Require both a good shape and color before accepting candidates
+            if shape_ok and color_ok and total_ok:
+                # For speed limits, accept only when template OR OCR confirms digits
+                if sign_type == 'speed_limit':
+                    speed_from_ocr = self.extract_speed_from_roi(image, bbox)
+                    if template_ok or speed_from_ocr:
+                        best_confidence = total_conf
+                        best_debug = {
+                            'shape': float(shape_conf),
+                            'color': float(color_conf),
+                            'template': float(template_conf),
+                            'bbox': bbox,
+                            'type': sign_type
+                        }
+
+                        if speed_from_ocr:
+                            best_detection = f"speed_limit_{speed_from_ocr}"
+                        elif template_key and 'speed_limit' in template_key:
+                            parts = template_key.split('_')
+                            if len(parts) >= 3:
+                                speed_num = parts[2]
+                                best_detection = f"speed_limit_{speed_num}"
+                            else:
+                                best_detection = "speed_limit"
                         else:
                             best_detection = "speed_limit"
-                    else:
+                else:
+                    # For other signs require a decent template match as confirmation
+                    if template_ok:
+                        best_confidence = total_conf
+                        best_debug = {
+                            'shape': float(shape_conf),
+                            'color': float(color_conf),
+                            'template': float(template_conf),
+                            'bbox': bbox,
+                            'type': sign_type
+                        }
                         best_detection = sign_type
         
-        return best_detection, best_confidence
+        return best_detection, best_confidence, best_debug
 
 def main(args=None):
     rclpy.init(args=args)

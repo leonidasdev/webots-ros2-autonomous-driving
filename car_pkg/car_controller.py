@@ -14,7 +14,11 @@ class CarController(Node):
         self.current_speed = self.base_speed
         self.max_speed = self.base_speed
         
-        self.speed_conversion_factor = 0.5
+        # Factor para convertir la unidad interna (por ejemplo km/h) a la
+        # velocidad que aplicaremos a los motores en Webots (rad/s o unidad
+        # del simulador). Reducido para que el coche vaya más despacio en Webots.
+        # Ejemplo: 80 (km/h like unit) * 0.1 => 8 (motor units)
+        self.speed_conversion_factor = 0.3
         
         # Estado de control
         self.steering = 0.0
@@ -98,6 +102,7 @@ class CarController(Node):
         self.yield_speed_active = True
         # Establecer velocidad máxima a la mitad
         self.max_speed = self.base_speed / 2.0
+        self.get_logger().info(f"YIELD received: max_speed set to {self.max_speed}")
         
     def handle_stop(self):
         """Maneja señal STOP - parada completa por 1 segundo"""
@@ -108,6 +113,7 @@ class CarController(Node):
         
         # Desactivar yield temporalmente
         self.yield_speed_active = False
+        self.get_logger().info(f"STOP received: stopping for {self.stop_duration}s")
         
     def handle_speed_limit(self):
         """Maneja señal de velocidad máxima"""
@@ -116,7 +122,9 @@ class CarController(Node):
             parts = self.last_sign.split('_')
             speed_number = int(parts[-1])
             
-            self.max_speed = speed_number * self.speed_conversion_factor
+            # Guardar el límite en las unidades internas (ej. km/h-like). La
+            # conversión a unidades de motor se aplica al publicar.
+            self.max_speed = speed_number
             
             # Limitar valores razonables
             if self.max_speed < 10:
@@ -131,6 +139,7 @@ class CarController(Node):
             # Si no estamos parados, ajustar velocidad actual
             if not self.is_stopped:
                 self.current_speed = min(self.current_speed, self.max_speed)
+            self.get_logger().info(f"SPEED_LIMIT received: set max_speed to {self.max_speed}")
                 
         except (ValueError, IndexError):
             self.max_speed = self.base_speed
@@ -153,6 +162,7 @@ class CarController(Node):
             self.max_speed = self.base_speed
             
         self.current_speed = self.max_speed
+        self.get_logger().info(f"Resuming after STOP: max_speed={self.max_speed}, current_speed={self.current_speed}")
         
     def control_loop(self):
         """Loop principal de control"""
@@ -168,9 +178,9 @@ class CarController(Node):
             elif self.current_speed < self.max_speed:
                 self.current_speed = min(self.max_speed, self.current_speed + self.speed_step)
             
-            # Publicar velocidad
+            # Publicar velocidad (convertida para Webots)
             speed_msg = Float32()
-            speed_msg.data = self.current_speed
+            speed_msg.data = self.current_speed * self.speed_conversion_factor
             self.speed_pub.publish(speed_msg)
             
             # Publicar dirección

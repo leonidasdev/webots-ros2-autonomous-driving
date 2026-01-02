@@ -1,0 +1,4 @@
+opencv-python>=4.5.5
+numpy>=1.21
+pytesseract>=0.3.10
+matplotlib>=3.5

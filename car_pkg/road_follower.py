@@ -28,28 +28,31 @@ class RoadFollower(Node):
         # Sistema de memoria
         self.last_known_road_center = 256  # Centro de la imagen (512/2)
         
-        # Historial para suavizado
+        # Historial para suavizado (reducido para respuesta más rápida ~2x)
         self.road_center_history = []
-        self.history_size = 7
+        self.history_size = 4
         
         # Modo cruce de peatones
         self.crosswalk_mode = False
         self.crosswalk_start_time = 0
-        self.crosswalk_lock_time = 3.0  # 3 segundos de lock
+        # Tiempo de bloqueo cuando se detectaba un crosswalk.
+        # Reducido 5x para reaccionar más rápido al tráfico.
+        # Antes: 3.0s -> Ahora: 0.6s
+        self.crosswalk_lock_time = 0.6  # segundos
         
         # Umbrales de detección
         self.yellow_threshold = 0.30  # >30% amarillo = crosswalk
         self.thin_line_threshold = 0.15  # <15% amarillo = línea fina
         
-        # Contadores para estabilidad
+        # Contadores para estabilidad (reducción para transiciones más rápidas)
         self.consecutive_yellow_frames = 0
-        self.min_yellow_frames = 2
+        self.min_yellow_frames = 1
         self.consecutive_thin_line_frames = 0
-        self.min_thin_line_frames = 3
+        self.min_thin_line_frames = 1
         
-        # Historial para filtrado
+        # Historial para filtrado (más reactivo)
         self.yellow_ratio_history = []
-        self.yellow_history_size = 5
+        self.yellow_history_size = 3
         
         # Controlador PID
         self.Kp = 0.005
@@ -61,15 +64,15 @@ class RoadFollower(Node):
         self.integral_max = 100.0
         self.max_steering = 0.25
         
-        # Filtros de suavizado
+        # Filtros de suavizado reducidos para mayor reactividad (~2x)
         self.error_history = []
-        self.error_history_size = 7
+        self.error_history_size = 3
         self.steering_history = []
-        self.steering_history_size = 7
+        self.steering_history_size = 3
         self.center_history = []
-        self.center_history_size = 9
+        self.center_history_size = 5
         self.error_trend = []
-        self.error_trend_size = 10
+        self.error_trend_size = 5
         
         # Estado de curva
         self.in_curve = False
