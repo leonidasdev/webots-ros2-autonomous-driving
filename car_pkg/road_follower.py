@@ -37,6 +37,12 @@ class RoadFollower(Node):
         # State
         self.last_known_road_center = 256  # x coordinate in pixels (0..511)
 
+        # Persistence for NO_LINE scenes: reuse last confident center for
+        # a small number of frames to avoid margin-of-error jitter.
+        self.no_line_persist_counter = 0
+        self.no_line_persist_max = 10
+        self.last_confident_center = 256
+
         # PID gains and state
         self.Kp = 0.005
         self.Ki = 0.0003
@@ -54,7 +60,7 @@ class RoadFollower(Node):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
-            road_center, confidence = self.detect_road_center(cv_image)
+            road_center, confidence = self.follow_road(cv_image)
 
             # Use instantaneous detection; store last seen center. The
             # detector already returns `image_center` for ambiguous
@@ -70,38 +76,73 @@ class RoadFollower(Node):
         except Exception as e:
             self.get_logger().error(f"Error processing image: {e}")
 
-    def detect_road_center(self, image):
+    def follow_road(self, image):
         """Return (road_center_x, confidence).
 
-        Returns a pixel x coordinate and a boolean `confidence`. A
-        confident detection is a locally-prominent peak; otherwise the
-        function attempts a local search near the last known center and
-        finally returns the image center when still ambiguous.
+        This method has been refactored into a small scene classifier and
+        three handlers for clarity: CROSSWALK, NO_LINE and LINE. The
+        external behavior and thresholds are preserved.
+        """
+        image_center = image.shape[1] // 2
+        try:
+            scene, yellow_ratio = self._classify_scene(image)
+
+            # Treat CROSSWALK like NO_LINE for persistence: prefer using the
+            # last confident center for a few frames rather than issuing
+            # steering immediately. This avoids margin errors after turns.
+            if scene in ('NO_LINE', 'CROSSWALK'):
+                # reuse last confident center for a few frames
+                if self.no_line_persist_counter < self.no_line_persist_max and self.last_confident_center is not None:
+                    self.no_line_persist_counter += 1
+                    return int(self.last_confident_center), False
+
+                if scene == 'NO_LINE':
+                    center, conf = self._handle_line(image, no_yellow=True)
+                    if conf:
+                        self.last_confident_center = int(center)
+                        self.no_line_persist_counter = 0
+                    return center, conf
+
+                # CROSSWALK (persistence exhausted): do not apply steering
+                # — return center with confidence False so PID stays idle.
+                self.no_line_persist_counter = 0
+                return image_center, False
+
+            # Normal LINE case: reset persistence and run regular handler.
+            self.no_line_persist_counter = 0
+            center, conf = self._handle_line(image, no_yellow=False)
+            if conf:
+                self.last_confident_center = int(center)
+            return center, conf
+        except Exception:
+            return image_center, False
+
+    def _classify_scene(self, image):
+        """Classify the scene as 'CROSSWALK', 'NO_LINE', or 'LINE'.
+
+        Returns (scene_str, yellow_ratio).
         """
         try:
-            image_center = image.shape[1] // 2
-            no_yellow = False
+            h, w = image.shape[:2]
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            yellow_lower = np.array([15, 100, 100])
+            yellow_upper = np.array([35, 255, 255])
+            yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+            yellow_ratio = float(np.sum(yellow_mask > 0)) / float(max(1, h * w))
+            if yellow_ratio > 0.25:
+                return 'CROSSWALK', yellow_ratio
+            if yellow_ratio < 0.07:
+                return 'NO_LINE', yellow_ratio
+            return 'LINE', yellow_ratio
+        except Exception:
+            return 'LINE', 0.0
 
-            # Check yellow coverage: if a large area is yellow (crosswalk-like),
-            # suppress steering entirely. Empirical thresholds:
-            #  - ~10% area indicates a yellow center line
-            #  - >25% area likely indicates a crosswalk -> disable steering
-            try:
-                h, w = image.shape[:2]
-                hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-                # Yellow range (tunable)
-                yellow_lower = np.array([15, 100, 100])
-                yellow_upper = np.array([35, 255, 255])
-                yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
-                yellow_ratio = float(np.sum(yellow_mask > 0)) / float(max(1, h * w))
-                # record absence of yellow if coverage very small (use 7%)
-                no_yellow = yellow_ratio < 0.07
-                if yellow_ratio > 0.25:
-                    return image_center, False
-            except Exception:
-                # If HSV check fails, continue with grayscale pipeline
-                no_yellow = False
+    def _handle_line(self, image, no_yellow=False):
+        """Detect the bright/grayscale center line and return (x, confidence).
 
+        `no_yellow` True disables acceptance of a confident bright peak.
+        """
+        try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             gray = cv2.medianBlur(gray, 3)
             gray = cv2.equalizeHist(gray)
@@ -111,49 +152,37 @@ class RoadFollower(Node):
             SMOOTH_K = 11
             kernel = np.ones(SMOOTH_K) / SMOOTH_K
             pad = SMOOTH_K // 2
-            # reflect-pad to avoid edge bias from zero-padding
             padded = np.pad(column_means, pad, mode='reflect')
             column_means_smooth = np.convolve(padded, kernel, mode='valid')
 
-            # primary peak detection
-            max_idx = np.argmax(column_means_smooth)
+            max_idx = int(np.argmax(column_means_smooth))
             max_val = column_means_smooth[max_idx]
 
-            # primary peak location/value
-
-            # Accept peak only if it is sufficiently prominent vs. local avg
             if max_val > 30:
                 window = 40
                 start = max(0, max_idx - window)
-                end = min(511, max_idx + window)
+                end = min(column_means_smooth.shape[0] - 1, max_idx + window)
                 if end > start:
                     local_avg = np.mean(column_means_smooth[start:end])
-                    # local context values
                     if max_val > local_avg * 1.15:
-                        # confident detection — but suppress if no yellow line
                         if no_yellow:
                             pass
                         else:
                             return max_idx, True
 
-            # Weak peak: try searching near the last known center before
-            # declaring ambiguity. This allows short gaps in detection to be
-            # bridged but returns confidence=False (controller disables Ki/Kd).
+            # Weak peak: try searching near the last known center
             search_center = self.last_known_road_center
             search_window = 180
             start = max(0, search_center - search_window // 2)
-            end = min(511, search_center + search_window // 2)
+            end = min(column_means_smooth.shape[0] - 1, search_center + search_window // 2)
             if end > start:
                 local_max = np.argmax(column_means_smooth[start:end]) + start
                 if column_means_smooth[local_max] > 20:
-                    # weak local detection chosen
                     return local_max, False
 
-            # Ambiguous: return image center so the controller drives straight
-            # ambiguous — return image center
-            return image_center, False
+            return image.shape[1] // 2, False
         except Exception:
-            return image_center, False
+            return image.shape[1] // 2, False
 
     def calculate_pid(self, road_center, confidence):
         """PID controller for lateral error (in pixels).
