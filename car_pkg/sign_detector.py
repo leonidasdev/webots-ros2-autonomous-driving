@@ -519,17 +519,18 @@ class SignDetector(Node):
                 
                 if time_since_last > cooldown or detected_sign != self.last_sign_detected:
                     # Log detection with per-cue confidences when available
-                    if debug:
-                        s_conf = debug.get('shape', 0.0)
-                        c_conf = debug.get('color', 0.0)
-                        t_conf = debug.get('template', 0.0)
-                        bbox = debug.get('bbox')
-                        self.get_logger().info(
-                            f"Señal detectada: {detected_sign} ({confidence:.3f}) "
-                            f"shape={s_conf:.3f} color={c_conf:.3f} template={t_conf:.3f} bbox={bbox}"
-                        )
-                    else:
-                        self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence:.3f})")
+                    # Detection logging disabled to reduce runtime noise
+                    # if debug:
+                    #     s_conf = debug.get('shape', 0.0)
+                    #     c_conf = debug.get('color', 0.0)
+                    #     t_conf = debug.get('template', 0.0)
+                    #     bbox = debug.get('bbox')
+                    #     self.get_logger().info(
+                    #         f"Señal detectada: {detected_sign} ({confidence:.3f}) "
+                    #         f"shape={s_conf:.3f} color={c_conf:.3f} template={t_conf:.3f} bbox={bbox}"
+                    #     )
+                    # else:
+                    #     self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence:.3f})")
                     
                     self.last_sign_detected = detected_sign
                     self.last_detection_time = current_time
@@ -575,14 +576,15 @@ class SignDetector(Node):
                           color_conf * weights['color'] +
                           template_conf * weights['template'])
             # Log per-candidate confidences to diagnose why detections are suppressed
-            try:
-                self.get_logger().info(
-                    f"Candidate {sign_type} bbox={bbox} "
-                    f"shape={shape_conf:.3f} color={color_conf:.3f} "
-                    f"template={template_conf:.3f} total={total_conf:.3f}"
-                )
-            except Exception:
-                pass
+            # per-candidate logging disabled to reduce console spam
+            # try:
+            #     self.get_logger().info(
+            #         f"Candidate {sign_type} bbox={bbox} "
+            #         f"shape={shape_conf:.3f} color={color_conf:.3f} "
+            #         f"template={template_conf:.3f} total={total_conf:.3f}"
+            #     )
+            # except Exception:
+            #     pass
             
             shape_ok = shape_conf > thresholds['shape']
             color_ok = color_conf > thresholds['color']
