@@ -92,26 +92,26 @@ class WebotsBridge(Node):
         
     def publish_data(self):
         if self.robot.step(self.timestep) != -1:
-                try:
-                    # Publish `car_camera` image
-                    car_image_data = self.car_camera.getImage()
-                    if car_image_data:
-                        car_image = np.frombuffer(car_image_data, np.uint8).reshape(
-                            (self.car_camera.getHeight(), self.car_camera.getWidth(), 4))
-                        car_image_rgb = cv2.cvtColor(car_image, cv2.COLOR_BGRA2BGR)
-                        car_msg = self.bridge.cv2_to_imgmsg(car_image_rgb, "bgr8")
-                        self.car_camera_pub.publish(car_msg)
+            try:
+                # Publish `car_camera` image
+                car_image_data = self.car_camera.getImage()
+                if car_image_data:
+                    car_image = np.frombuffer(car_image_data, np.uint8).reshape(
+                        (self.car_camera.getHeight(), self.car_camera.getWidth(), 4))
+                    car_image_rgb = cv2.cvtColor(car_image, cv2.COLOR_BGRA2BGR)
+                    car_msg = self.bridge.cv2_to_imgmsg(car_image_rgb, "bgr8")
+                    self.car_camera_pub.publish(car_msg)
 
-                    # Publish `road_camera` image
-                    road_image_data = self.road_camera.getImage()
-                    if road_image_data:
-                        road_image = np.frombuffer(road_image_data, np.uint8).reshape(
-                            (self.road_camera.getHeight(), self.road_camera.getWidth(), 4))
-                        road_image_rgb = cv2.cvtColor(road_image, cv2.COLOR_BGRA2BGR)
-                        road_msg = self.bridge.cv2_to_imgmsg(road_image_rgb, "bgr8")
-                        self.road_camera_pub.publish(road_msg)
-                except Exception as e:
-                    self.get_logger().error(f"Error publishing images: {e}")
+                # Publish `road_camera` image
+                road_image_data = self.road_camera.getImage()
+                if road_image_data:
+                    road_image = np.frombuffer(road_image_data, np.uint8).reshape(
+                        (self.road_camera.getHeight(), self.road_camera.getWidth(), 4))
+                    road_image_rgb = cv2.cvtColor(road_image, cv2.COLOR_BGRA2BGR)
+                    road_msg = self.bridge.cv2_to_imgmsg(road_image_rgb, "bgr8")
+                    self.road_camera_pub.publish(road_msg)
+            except Exception as e:
+                self.get_logger().error(f"Error publishing images: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
