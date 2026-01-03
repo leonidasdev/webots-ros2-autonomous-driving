@@ -28,6 +28,7 @@ class RoadFollower(Node):
     def __init__(self):
         super().__init__('road_follower')
         self.bridge = CvBridge()
+        # keep default logger level (no temporary debug overrides)
 
         # Subscriptions / publishers
         self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
@@ -53,19 +54,18 @@ class RoadFollower(Node):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
-            if cv_image.shape[0] == 16 and cv_image.shape[1] == 512:
-                road_center, confidence = self.detect_road_center(cv_image)
+            road_center, confidence = self.detect_road_center(cv_image)
 
-                # Use instantaneous detection; store last seen center. The
-                # detector already returns `image_center` for ambiguous
-                # frames, so we do not use `last_known_road_center` to
-                # override ambiguous results.
-                self.last_known_road_center = int(road_center)
-                steering = self.calculate_pid(self.last_known_road_center, confidence)
+            # Use instantaneous detection; store last seen center. The
+            # detector already returns `image_center` for ambiguous
+            # frames, so we do not use `last_known_road_center` to
+            # override ambiguous results.
+            self.last_known_road_center = int(road_center)
+            steering = self.calculate_pid(self.last_known_road_center, confidence)
 
-                steering_msg = Float32()
-                steering_msg.data = steering
-                self.steering_pub.publish(steering_msg)
+            steering_msg = Float32()
+            steering_msg.data = steering
+            self.steering_pub.publish(steering_msg)
 
         except Exception as e:
             self.get_logger().error(f"Error processing image: {e}")
@@ -80,6 +80,28 @@ class RoadFollower(Node):
         """
         try:
             image_center = image.shape[1] // 2
+            no_yellow = False
+
+            # Check yellow coverage: if a large area is yellow (crosswalk-like),
+            # suppress steering entirely. Empirical thresholds:
+            #  - ~10% area indicates a yellow center line
+            #  - >25% area likely indicates a crosswalk -> disable steering
+            try:
+                h, w = image.shape[:2]
+                hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+                # Yellow range (tunable)
+                yellow_lower = np.array([15, 100, 100])
+                yellow_upper = np.array([35, 255, 255])
+                yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+                yellow_ratio = float(np.sum(yellow_mask > 0)) / float(max(1, h * w))
+                # record absence of yellow if coverage very small (use 7%)
+                no_yellow = yellow_ratio < 0.07
+                if yellow_ratio > 0.25:
+                    return image_center, False
+            except Exception:
+                # If HSV check fails, continue with grayscale pipeline
+                no_yellow = False
+
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             gray = cv2.medianBlur(gray, 3)
             gray = cv2.equalizeHist(gray)
@@ -97,11 +119,7 @@ class RoadFollower(Node):
             max_idx = np.argmax(column_means_smooth)
             max_val = column_means_smooth[max_idx]
 
-            # Debug: report primary peak location and value (debug-level)
-            try:
-                self.get_logger().debug(f"detect: max_idx={int(max_idx)} max_val={float(max_val):.2f} image_center={image_center}")
-            except Exception:
-                pass
+            # primary peak location/value
 
             # Accept peak only if it is sufficiently prominent vs. local avg
             if max_val > 30:
@@ -110,17 +128,13 @@ class RoadFollower(Node):
                 end = min(511, max_idx + window)
                 if end > start:
                     local_avg = np.mean(column_means_smooth[start:end])
-                    # Debug: local context values
-                    try:
-                        self.get_logger().debug(f"detect: local window [{start}:{end}] local_avg={local_avg:.2f}")
-                    except Exception:
-                        pass
+                    # local context values
                     if max_val > local_avg * 1.15:
-                        try:
-                            self.get_logger().debug(f"detect CONFIDENT: center={int(max_idx)} val={float(max_val):.2f} local_avg={local_avg:.2f}")
-                        except Exception:
+                        # confident detection — but suppress if no yellow line
+                        if no_yellow:
                             pass
-                        return max_idx, True
+                        else:
+                            return max_idx, True
 
             # Weak peak: try searching near the last known center before
             # declaring ambiguity. This allows short gaps in detection to be
@@ -132,17 +146,11 @@ class RoadFollower(Node):
             if end > start:
                 local_max = np.argmax(column_means_smooth[start:end]) + start
                 if column_means_smooth[local_max] > 20:
-                    try:
-                        self.get_logger().debug(f"detect WEAK_LOCAL: chosen={int(local_max)} val={float(column_means_smooth[local_max]):.2f} last_known={search_center}")
-                    except Exception:
-                        pass
+                    # weak local detection chosen
                     return local_max, False
 
             # Ambiguous: return image center so the controller drives straight
-            try:
-                self.get_logger().debug("detect AMBIGUOUS: returning image_center")
-            except Exception:
-                pass
+            # ambiguous — return image center
             return image_center, False
         except Exception:
             return image_center, False
@@ -200,17 +208,7 @@ class RoadFollower(Node):
         # Force zero steering when detection is not confident to avoid
         # acting on unreliable measurements (actuator dynamics may still
         # carry the vehicle, but no new steering command is issued).
-        # Debug: report PID components and steering before optional forcing
-        try:
-            self.get_logger().debug(f"PID: error={filtered_error:.2f} dt={dt:.4f} P={P:.6f} I={I:.6f} D={D:.6f} steering={steering:.6f} confidence={confidence}")
-        except Exception:
-            pass
-
         if not confidence:
-            try:
-                self.get_logger().debug("PID: low confidence -> forcing steering=0.0")
-            except Exception:
-                pass
             steering = 0.0
 
         # update state
