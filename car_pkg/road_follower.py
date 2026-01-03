@@ -40,7 +40,7 @@ class RoadFollower(Node):
         # Persistence for NO_LINE scenes: reuse last confident center for
         # a small number of frames to avoid margin-of-error jitter.
         self.no_line_persist_counter = 0
-        self.no_line_persist_max = 10
+        self.no_line_persist_max = 15
         self.last_confident_center = 256
 
         # PID gains and state
@@ -87,24 +87,28 @@ class RoadFollower(Node):
         try:
             scene, yellow_ratio = self._classify_scene(image)
 
-            # Treat CROSSWALK like NO_LINE for persistence: prefer using the
-            # last confident center for a few frames rather than issuing
-            # steering immediately. This avoids margin errors after turns.
+            # Treat CROSSWALK the same as NO_LINE: try to recover using the
+            # detector in `no_yellow` mode and otherwise fall back to the
+            # most recent confident center from history. This uses history
+            # to determine steering when detections are unreliable.
             if scene in ('NO_LINE', 'CROSSWALK'):
                 # reuse last confident center for a few frames
                 if self.no_line_persist_counter < self.no_line_persist_max and self.last_confident_center is not None:
                     self.no_line_persist_counter += 1
                     return int(self.last_confident_center), False
 
-                if scene == 'NO_LINE':
-                    center, conf = self._handle_line(image, no_yellow=True)
-                    if conf:
-                        self.last_confident_center = int(center)
-                        self.no_line_persist_counter = 0
+                # Attempt to detect a weak/no-yellow line in the current frame.
+                center, conf = self._handle_line(image, no_yellow=True)
+                if conf:
+                    # recovered a confident center — store and reset persistence
+                    self.last_confident_center = int(center)
+                    self.no_line_persist_counter = 0
                     return center, conf
 
-                # CROSSWALK (persistence exhausted): do not apply steering
-                # — return center with confidence False so PID stays idle.
+                # Still unconfident: fall back to last known confident center
+                # if available, otherwise return image center (no steering).
+                if self.last_confident_center is not None:
+                    return int(self.last_confident_center), False
                 self.no_line_persist_counter = 0
                 return image_center, False
 
