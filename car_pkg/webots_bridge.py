@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+"""Bridge node between Webots and ROS2.
+
+This node exposes Webots devices to ROS2 topics and applies control
+commands coming from ROS. It publishes camera images and subscribes to
+speed/steering commands issued by the controller.
+"""
+
 import rclpy
 from rclpy.node import Node
 from controller import Robot
@@ -10,13 +17,21 @@ from cv_bridge import CvBridge
 import cv2
 from std_msgs.msg import Float32
 
+
 class WebotsBridge(Node):
+    """Expose Webots sensors/actuators as ROS2 topics.
+
+    - Publishes `/car_camera/image` and `/road_camera/image` (sensor_msgs/Image)
+    - Subscribes to `/control/speed` and `/control/steering` (Float32)
+    - Applies speed to rear-wheel motors and steering positions to steer motors
+    """
+
     def __init__(self):
         super().__init__('webots_bridge')
-        
-        self.get_logger().info("Iniciando conexión con Webots...")
-        
-        # Connect to Webots
+
+        self.get_logger().info("Connecting to Webots...")
+
+        # Connect to Webots controller
         try:
             self.robot = Robot()
             self.timestep = int(self.robot.getBasicTimeStep())
@@ -24,29 +39,25 @@ class WebotsBridge(Node):
         except Exception as e:
             self.get_logger().error(f"Error connecting to Webots: {e}")
             sys.exit(1)
-            
-        # Get camera devices
+
+        # Acquire camera devices
         try:
             self.car_camera = self.robot.getDevice('car_camera')
             self.road_camera = self.robot.getDevice('road_camera')
             self.get_logger().info("Cameras found")
-        except:
+        except Exception:
             self.get_logger().error("Could not find cameras")
             sys.exit(1)
-        
-        # Only configure the motors we expect
+
+        # Configure expected motors
         self.motors = {}
-        motor_names = [
-            'right_steer', 
-            'left_steer', 
-            'right_rear_wheel', 
-            'left_rear_wheel'
-        ]
-        
+        motor_names = ['right_steer', 'left_steer', 'right_rear_wheel', 'left_rear_wheel']
+
         for name in motor_names:
             try:
                 motor = self.robot.getDevice(name)
                 self.motors[name] = motor
+                # Wheels are velocity-controlled (infinite position)
                 if 'wheel' in name:
                     motor.setPosition(float('inf'))
                     motor.setVelocity(0.0)
@@ -54,43 +65,47 @@ class WebotsBridge(Node):
             except Exception as e:
                 self.get_logger().error(f"Error configuring motor {name}: {e}")
                 sys.exit(1)
-        
-        # Enable devices
+
+        # Enable camera sampling at the Webots basic time step
         self.car_camera.enable(self.timestep)
         self.road_camera.enable(self.timestep)
-        
+
         self.bridge = CvBridge()
         self.current_speed = 0.0
         self.current_steering = 0.0
-        
+
         # Publishers for camera images
         self.car_camera_pub = self.create_publisher(Image, '/car_camera/image', 10)
         self.road_camera_pub = self.create_publisher(Image, '/road_camera/image', 10)
-        
+
         # Subscribers for control commands
-        self.speed_sub = self.create_subscription(
-            Float32, '/control/speed', self.speed_callback, 10)
-        self.steering_sub = self.create_subscription(
-            Float32, '/control/steering', self.steering_callback, 10)
-        
-        # Timer to publish data — use Webots basicTimeStep (ms -> s)
+        self.speed_sub = self.create_subscription(Float32, '/control/speed', self.speed_callback, 10)
+        self.steering_sub = self.create_subscription(Float32, '/control/steering', self.steering_callback, 10)
+
+        # Timer to publish sensor data (convert ms -> s)
         self.timer = self.create_timer(self.timestep / 1000.0, self.publish_data)
-        
+
         self.get_logger().info("Webots Bridge ready")
-        
+
     def speed_callback(self, msg):
+        """Apply a desired speed to rear wheels (clamped).
+
+        The simulator expects motor velocity values. Clamp to a safe range.
+        """
         self.current_speed = max(0.0, min(msg.data, 100.0))
         # Apply speed only to rear wheels
         self.motors['right_rear_wheel'].setVelocity(self.current_speed)
         self.motors['left_rear_wheel'].setVelocity(self.current_speed)
-        
+
     def steering_callback(self, msg):
+        """Apply a steering position to the steer motors (clamped)."""
         self.current_steering = max(-0.5, min(msg.data, 0.5))
         # Apply steering position to both steering motors
         self.motors['right_steer'].setPosition(self.current_steering)
         self.motors['left_steer'].setPosition(self.current_steering)
-        
+
     def publish_data(self):
+        """Step the simulator and publish camera images to ROS topics."""
         if self.robot.step(self.timestep) != -1:
             try:
                 # Publish `car_camera` image
@@ -113,6 +128,7 @@ class WebotsBridge(Node):
             except Exception as e:
                 self.get_logger().error(f"Error publishing images: {e}")
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = WebotsBridge()
@@ -123,6 +139,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

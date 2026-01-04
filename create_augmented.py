@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""
-create_augmented.py - generate simple augmentations into `resources/`.
+"""create_augmented.py - generate pre-scaled color templates in resources/.
 
-This script produces scale variants of the
-original color templates and writes color copies into
-the `resources/` folder using the `_aug_` filename pattern. The detector
-expects these pre-scaled templates so no runtime resizing is necessary.
+This script creates canonical color copies of original templates and
+writes a small set of pre-scaled variants (named with `_scaleNN`) into
+the package `resources/` folder. The detector loads these pre-generated
+templates so no runtime resizing is required.
 
 Usage:
     python create_augmented.py
@@ -31,6 +30,15 @@ def transform_image(img, scale=1.0):
 
 
 def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
+    """Generate canonical `_aug_N` copies and corresponding scaled templates.
+
+    Arguments:
+        input_dir (str): Path to the `resources/` folder. If None the
+            script-local `resources/` is used.
+        max_per_image (int): Maximum number of canonical `_aug_N` copies
+            to create per original image.
+        seed_val (int): Random seed for deterministic behavior.
+    """
     seed(seed_val)
     np.random.seed(seed_val)
 
@@ -61,7 +69,8 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
     print(f"Found {len(originals)} original templates. Generating up to {max_per_image} variants each...")
 
-    # Parameter pools: only scaling. Keep color.
+    # Scales produced for each canonical copy. Values >1.0 are zoomed-in
+    # (larger) templates; values <1.0 are zoomed-out (smaller) templates.
     output_scales = [1.0, 1.1, 1.2, 1.3, 0.9, 0.8]
 
     for fname in originals:

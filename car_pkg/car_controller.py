@@ -27,7 +27,9 @@ class CarController(Node):
         
         # STOP state
         self.is_stopped = False
-        self.stop_start_time = 0
+        # Use simulation clock nanoseconds for accurate sim-time STOP timing.
+        # Stored as integer nanoseconds. Fallback to wall-clock if needed.
+        self.stop_start_time_ns = 0
         self.stop_duration = 1.0
         
         # Yield state
@@ -105,10 +107,31 @@ class CarController(Node):
         """Handle STOP: stop for configured duration."""
         self.current_speed = 0.0
         self.is_stopped = True
-        self.stop_start_time = time.time()
-        # disable yield while stopped
+        # Record stop start time in simulation time (ns) when available.
+        try:
+            self.stop_start_time_ns = self.get_clock().now().nanoseconds
+        except Exception:
+            # Fallback: store wall-clock time as nanoseconds
+            self.stop_start_time_ns = int(time.time() * 1e9)
+        # Disable yield once stopped
         self.yield_speed_active = False
-        self.get_logger().info(f"STOP received: stopping for {self.stop_duration}s")
+        # Detect whether simulated time appears active. Prefer the explicit
+        # `use_sim_time` parameter if set; otherwise look for a `/clock` topic.
+        sim_time_active = False
+        try:
+            if self.has_parameter('use_sim_time'):
+                try:
+                    sim_time_active = bool(self.get_parameter('use_sim_time').value)
+                except Exception:
+                    sim_time_active = False
+            else:
+                # Check published topics for /clock
+                topics = [t for (t, _) in self.get_topic_names_and_types()]
+                sim_time_active = '/clock' in topics
+        except Exception:
+            sim_time_active = False
+
+        self.get_logger().info(f"STOP received: stopping for {self.stop_duration}s (sim_time={'ON' if sim_time_active else 'OFF'})")
         
     def handle_speed_limit(self):
         """Handle SPEED_LIMIT: parse and apply new max speed."""
@@ -127,9 +150,8 @@ class CarController(Node):
             elif self.max_speed > 100:
                 self.max_speed = 100
                 
-            # If yield is active, cap max speed to half the limit
-            if self.yield_speed_active:
-                self.max_speed = self.max_speed / 2.0
+            # Disable yield when a speed limit is explicitly set
+            self.yield_speed_active = False
                 
             # If not stopped, ensure current speed does not exceed the new limit
             if not self.is_stopped:
@@ -145,19 +167,27 @@ class CarController(Node):
             
     def check_stop_timer(self):
         """Check whether the STOP duration has elapsed and resume if so."""
-        if self.is_stopped and (time.time() - self.stop_start_time) >= self.stop_duration:
-            self.resume_after_stop()
+        if not self.is_stopped:
+            return
+
+        # Prefer simulation clock (nanoseconds). If get_clock() isn't
+        # publishing sim time, fall back to wall-clock comparison.
+        try:
+            now_ns = self.get_clock().now().nanoseconds
+            if (now_ns - self.stop_start_time_ns) >= int(self.stop_duration * 1e9):
+                self.resume_after_stop()
+        except Exception:
+            # Fallback to wall-clock seconds: stored ns -> seconds
+            try:
+                start_s = float(self.stop_start_time_ns) / 1e9
+                if (time.time() - start_s) >= self.stop_duration:
+                    self.resume_after_stop()
+            except Exception:
+                pass
         
     def resume_after_stop(self):
-        """Resume motion after STOP: restore appropriate max/current speed."""
+        """Resume motion after STOP: restore appropriate current speed with the max speed."""
         self.is_stopped = False
-
-        if self.yield_speed_active:
-            self.max_speed = self.base_speed / 2.0
-        elif self.last_sign and self.last_sign.startswith('speed_limit'):
-            self.handle_speed_limit()
-        else:
-            self.max_speed = self.base_speed
 
         self.current_speed = self.max_speed
         self.get_logger().info(f"Resuming after STOP: max_speed={self.max_speed}, current_speed={self.current_speed}")

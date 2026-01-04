@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 
+"""Sign detector node using template matching.
+
+This module implements a lightweight template-matching based traffic-sign
+detector for the Webots + ROS2 exercise. It loads pre-generated color
+templates from the package `resources/` folder and scans incoming camera
+frames using OpenCV's `matchTemplate` (TM_CCOEFF_NORMED).
+
+The node publishes simple string tokens on `/traffic_sign` such as
+`stop`, `yield` or `speed_limit_50` which the controller consumes.
+"""
+
 import rclpy
 from rclpy.node import Node
 import cv2
@@ -14,51 +25,67 @@ import time
 
 
 class SignDetector(Node):
+    """ROS2 node that detects traffic signs by template matching.
+
+    Behavior summary:
+    - Loads all image files from `resources/` (including pre-scaled `_scaleNN`
+      variants) into memory as BGR templates.
+    - For each incoming `/car_camera/image` frame, scans the full image with
+      each template using multi-channel BGR matching.
+    - Accepts a detection when the best match >= per-type threshold.
+    - Publishes a short string on `/traffic_sign` describing the sign.
+    """
+
     def __init__(self):
         super().__init__('sign_detector')
         self.bridge = CvBridge()
-        
-        # Control de estado y cooldowns
+
+        # Detection state and cooldowns
         self.last_sign_detected = None
         self.last_detection_time = 0
+        # Cooldowns (seconds) per sign family to avoid repeated publishes
         self.cooldowns = {'stop': 2.0, 'yield': 2.0, 'speed_limit': 1.5}
-        
-        # Comunicación ROS
-        self.image_sub = self.create_subscription(
-            Image, '/car_camera/image', self.image_callback, 10)
+
+        # ROS communication
+        self.image_sub = self.create_subscription(Image, '/car_camera/image', self.image_callback, 10)
         self.sign_pub = self.create_publisher(String, '/traffic_sign', 10)
-        
-        # Carga de plantillas
+
+        # Load templates from package resources (color BGR images)
         self.base_templates = self.load_base_templates()
-        # Template-only detector thresholds (matchTemplate thresholds)
+
+        # Per-type acceptance thresholds (TM_CCOEFF_NORMED)
         self.template_thresholds = {
             'stop': 0.60,
             'yield': 0.70,
             'speed_limit': 0.60
         }
-        # Minimum gap required between best and second-best match to accept detection
-        self.match_gap = 0.04
-        # Timestamp to rate-limit top-match logging when detections are ambiguous
+
+        # Previously we required a gap between best and second-best; the
+        # gap check is disabled by setting to 0.0 so ties are accepted.
+        self.match_gap = 0.0
+
+        # Used to rate-limit occasional debug/info logs
         self._last_match_log_time = 0.0
         
     def load_base_templates(self):
-        """Carga plantillas de señales desde el directorio de recursos"""
+        """Load sign templates from the package `resources/` folder.
+
+        Returns a dict mapping template keys to dicts with keys: 'bgr', 'h', 'w'.
+        """
         templates = {}
         try:
             package_share_dir = get_package_share_directory('car_pkg')
             
-            # Cargar desde el directorio `resources` en el paquete
+            # Load from the package `resources` directory
             target_path = os.path.join(package_share_dir, 'resources')
-            
-            # Fallback al directorio actual
+            # Fallback to the workspace copy if package install is not present
             if not os.path.exists(target_path):
                 current_dir = os.path.dirname(os.path.abspath(__file__))
                 target_path = os.path.join(current_dir, '..', 'resources')
                 target_path = os.path.normpath(target_path)
-            
             files = os.listdir(target_path) if os.path.exists(target_path) else []
-            
-            # Filtrar archivos de imagen
+
+            # Keep common image formats
             image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
             
             for filename in image_files:
@@ -94,21 +121,19 @@ class SignDetector(Node):
                     'h': h,
                     'w': w
                 }
-            # Log how many image files were present and how many templates loaded
-            try:
-                num_files = len(image_files)
-                num_templates = len(templates)
-                self.get_logger().info(f"Loaded {num_templates} templates from {target_path} ({num_files} image files found)")
-            except Exception:
-                pass
+                    # Intentionally silent: do not emit info logs here.
                     
         except Exception as e:
-            self.get_logger().error(f"Error cargando plantillas: {str(e)}")
+            self.get_logger().error(f"Error loading templates: {str(e)}")
         
         return templates
     
     def determine_sign_type(self, filename):
-        """Determina el tipo de señal basado en el nombre del archivo"""
+        """Determine the sign type from a template filename.
+
+        Returns (sign_type, speed_value) where speed_value is a string
+        when a numeric speed is present in the filename (e.g. '50').
+        """
         filename_lower = filename.lower()
         speed_value = None
         
@@ -124,7 +149,7 @@ class SignDetector(Node):
         return None, None
 
     def image_callback(self, msg):
-        """Procesa cada frame de la cámara"""
+        """Process each incoming camera frame and publish detections."""
         # Note: camera frames from Webots are 512x256 (w x h).
         # Typical sign ROIs extracted by downstream logic are very small
         # (about 22x27). The detector upscales tiny input frames to a
@@ -160,23 +185,14 @@ class SignDetector(Node):
                     self.last_sign_detected = detected_sign
                     self.last_detection_time = current_time
 
-                    # Log detection with confidence percentage and template info
-                    try:
-                        if debug:
-                            tpl = debug.get('template_key')
-                            bbox = debug.get('bbox')
-                            self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%) template={tpl} bbox={bbox}")
-                        else:
-                            self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%)")
-                    except Exception:
-                        pass
+
 
                     sign_msg = String()
                     sign_msg.data = detected_sign
                     self.sign_pub.publish(sign_msg)
             
         except Exception as e:
-            self.get_logger().error(f"Error procesando imagen: {str(e)}")
+            self.get_logger().error(f"Error processing image: {str(e)}")
 
     def detect_sign(self, image, original_image=None, scale=1.0):
         """Template-only detection over the whole image.
@@ -239,14 +255,7 @@ class SignDetector(Node):
 
         # Apply gap check to avoid ambiguous/weak matches
         if best_key is None:
-            # Log occasionally to help debug missing templates
-            try:
-                now = time.time()
-                if now - self._last_match_log_time > 1.0:
-                    self.get_logger().info(f"No template matches found (templates_loaded={len(self.base_templates)})")
-                    self._last_match_log_time = now
-            except Exception:
-                pass
+            # Silent: do not emit info logs when no templates match
             return None, 0.0, None
 
         # Determine sign_type from best key and threshold
@@ -272,16 +281,7 @@ class SignDetector(Node):
                 best_debug['second_best'] = float(second_best)
             return detection, best_confidence, best_debug
 
-        # Ambiguous or too-weak match: log top candidates occasionally
-        try:
-            now = time.time()
-            if now - self._last_match_log_time > 1.0:
-                self.get_logger().info(
-                    f"No confident template: best={best_confidence:.3f} second={second_best:.3f} best_key={best_key} thresh={thresh:.3f} gap_needed={self.match_gap:.3f}"
-                )
-                self._last_match_log_time = now
-        except Exception:
-            pass
+        # Ambiguous or too-weak match: remain silent (no info logging)
         return None, 0.0, best_debug
 
 def main(args=None):

@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 
+"""Road follower node: detect lane/road center and publish steering.
+
+This node subscribes to `/road_camera/image` (sensor_msgs/Image), finds a
+lateral road center using a lightweight column-intensity approach, and
+publishes steering commands (std_msgs/Float32) to `/control/steering`.
+
+Design goals:
+- Keep the detector simple and robust for a simulation environment.
+- Avoid control windup when visual detections are unreliable.
+- Fall back to recent confident detections for short outages.
+
+The PID controller operates on pixel error (pixels between detected
+center and image center). When `confidence` is False the controller
+resets or ignores integral/derivative contributions to prevent
+unwanted steering from noisy measurements.
+"""
+
 import rclpy
 from rclpy.node import Node
 import numpy as np
@@ -11,245 +28,280 @@ import time
 
 
 class RoadFollower(Node):
-    """ROS2 node that detects the road center from a forward camera and
-    publishes steering commands.
+    """ROS2 node that detects the road center and publishes steering.
 
-    Key points:
-      - Detection runs on per-frame column intensity (grayscale) and
-        finds a locally-prominent column as the road center. If ambiguous
-        the detector returns the image center so the vehicle keeps a
-        straight heading.
-      - Reflect-padding is used for the smoothing convolution to avoid
-        edge bias.
-      - PID acts on pixel error; integral and derivative are disabled and
-        reset when detection is unreliable to prevent windup and spikes.
+    Detection strategy:
+    - Compute a column-wise brightness profile, smooth it, and locate the
+        dominant peak as the lane/road center.
+    - Scenes are classified into `LINE`, `NO_LINE`, or `CROSSWALK` to decide
+        how to behave when clear lane markings are missing.
+    - For brief detection outages, the node reuses the last confident center
+        to avoid oscillatory steering commands.
     """
 
     def __init__(self):
         super().__init__('road_follower')
         self.bridge = CvBridge()
-        # keep default logger level (no temporary debug overrides)
 
-        # Subscriptions / publishers
+        # ROS topics
         self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
         self.steering_pub = self.create_publisher(Float32, '/control/steering', 10)
 
-        # State
-        self.last_known_road_center = 256  # x coordinate in pixels (0..511)
+        # Image center (pixels). Many simulator frames are 512 px wide; store
+        # a default here for cases where image metadata isn't available.
+        self.image_center = 256
 
-        # Persistence for NO_LINE scenes: reuse last confident center for
-        # a small number of frames to avoid margin-of-error jitter.
+        # Last observed centers and persistence counters used to smooth
+        # behavior when detections are weak or temporarily missing.
+        self.last_known_road_center = self.image_center
         self.no_line_persist_counter = 0
+        # Number of consecutive frames to reuse last confident center
+        # before attempting fresh recovery. At ~30 FPS, 15 frames ≈ 0.5 s.
         self.no_line_persist_max = 15
-        self.last_confident_center = 256
+        self.last_confident_center = self.image_center
 
-        # PID gains and state
+        # PID tuning (operates on pixel error). Values were chosen to be
+        # conservative for the simulator; tune as needed in-sim.
         self.Kp = 0.005
         self.Ki = 0.0003
         self.Kd = 0.0002
         self.integral = 0.0
         self.prev_error = 0.0
         self.prev_time = time.time()
+        # Clamp for integral term to limit long-term bias
         self.integral_max = 100.0
+        # Maximum absolute steering command (radians or simulator units)
         self.max_steering = 0.25
 
-        # Track previous detection confidence to detect transitions
+        # Track previous detection confidence to reset controller state on
+        # transitions from confident -> unconfident views.
         self.prev_confidence = True
 
-    def image_callback(self, msg):
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+def image_callback(self, msg):
+    """ROS subscriber callback: convert image and run the pipeline.
 
-            road_center, confidence = self.follow_road(cv_image)
+    Receives a `sensor_msgs/Image`, converts it to an OpenCV BGR image,
+    runs detection, computes steering via the PID controller, and
+    publishes a `std_msgs/Float32` with the steering command.
+    """
+    try:
+        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
-            # Use instantaneous detection; store last seen center. The
-            # detector already returns `image_center` for ambiguous
-            # frames, so we do not use `last_known_road_center` to
-            # override ambiguous results.
-            self.last_known_road_center = int(road_center)
-            steering = self.calculate_pid(self.last_known_road_center, confidence)
+        road_center, confidence = self.follow_road(cv_image)
 
-            steering_msg = Float32()
-            steering_msg.data = steering
-            self.steering_pub.publish(steering_msg)
+        # Store the latest detected center (integer pixels) and compute
+        # a steering command based on the controller state.
+        self.last_known_road_center = int(road_center)
+        steering = self.calculate_pid(self.last_known_road_center, confidence)
 
-        except Exception as e:
-            self.get_logger().error(f"Error processing image: {e}")
+        steering_msg = Float32()
+        steering_msg.data = steering
+        self.steering_pub.publish(steering_msg)
 
-    def follow_road(self, image):
-        """Return (road_center_x, confidence).
+    except Exception as e:
+        self.get_logger().error(f"Error processing image: {e}")
 
-        This method has been refactored into a small scene classifier and
-        three handlers for clarity: CROSSWALK, NO_LINE and LINE. The
-        external behavior and thresholds are preserved.
-        """
-        image_center = image.shape[1] // 2
-        try:
-            scene, yellow_ratio = self._classify_scene(image)
+def follow_road(self, image):
+    """Top-level detection pipeline.
 
-            # Treat CROSSWALK the same as NO_LINE: try to recover using the
-            # detector in `no_yellow` mode and otherwise fall back to the
-            # most recent confident center from history. This uses history
-            # to determine steering when detections are unreliable.
-            if scene in ('NO_LINE', 'CROSSWALK'):
-                # reuse last confident center for a few frames
-                if self.no_line_persist_counter < self.no_line_persist_max and self.last_confident_center is not None:
-                    self.no_line_persist_counter += 1
-                    return int(self.last_confident_center), False
+    Returns:
+        (road_center_x, confidence)
 
-                # Attempt to detect a weak/no-yellow line in the current frame.
-                center, conf = self._handle_line(image, no_yellow=True)
-                if conf:
-                    # recovered a confident center — store and reset persistence
-                    self.last_confident_center = int(center)
-                    self.no_line_persist_counter = 0
-                    return center, conf
+    The pipeline first classifies the scene then delegates to handlers
+    that implement recovery strategies for missing or ambiguous lane
+    markings. When confidence is False the returned center should be
+    treated as advisory and the controller will avoid aggressive
+    corrections.
+    """
+    image_center = image.shape[1] // 2
+    try:
+        scene, yellow_ratio = self._classify_scene(image)
 
-                # Still unconfident: fall back to last known confident center
-                # if available, otherwise return image center (no steering).
-                if self.last_confident_center is not None:
-                    return int(self.last_confident_center), False
-                self.no_line_persist_counter = 0
-                return image_center, False
+        # CROSSWALK and NO_LINE share a recovery strategy: reuse a
+        # recently confident center for a short persistence window to
+        # avoid jitter, otherwise attempt a weaker detection pass.
+        if scene in ('NO_LINE', 'CROSSWALK'):
+            if self.no_line_persist_counter < self.no_line_persist_max and self.last_confident_center is not None:
+                # Reuse previous confident center for stability
+                self.no_line_persist_counter += 1
+                return int(self.last_confident_center), False
 
-            # Normal LINE case: reset persistence and run regular handler.
-            self.no_line_persist_counter = 0
-            center, conf = self._handle_line(image, no_yellow=False)
+            # Try a relaxed detection pass that ignores strong yellow
+            # markers (useful when paint is faded or partially occluded).
+            center, conf = self._handle_line(image, no_yellow=True)
             if conf:
                 self.last_confident_center = int(center)
-            return center, conf
-        except Exception:
+                self.no_line_persist_counter = 0
+                return center, conf
+
+            # No reliable detection: fall back to last confident center
+            if self.last_confident_center is not None:
+                return int(self.last_confident_center), False
+            self.no_line_persist_counter = 0
             return image_center, False
 
-    def _classify_scene(self, image):
-        """Classify the scene as 'CROSSWALK', 'NO_LINE', or 'LINE'.
+        # LINE: normal detection path
+        self.no_line_persist_counter = 0
+        center, conf = self._handle_line(image, no_yellow=False)
+        if conf:
+            self.last_confident_center = int(center)
+        return center, conf
+    except Exception:
+        # On unexpected errors, return the image center and mark as
+        # unconfident so the controller avoids acting aggressively.
+        return image_center, False
 
-        Returns (scene_str, yellow_ratio).
-        """
-        try:
-            h, w = image.shape[:2]
-            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-            yellow_lower = np.array([15, 100, 100])
-            yellow_upper = np.array([35, 255, 255])
-            yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
-            yellow_ratio = float(np.sum(yellow_mask > 0)) / float(max(1, h * w))
-            if yellow_ratio > 0.25:
-                return 'CROSSWALK', yellow_ratio
-            if yellow_ratio < 0.07:
-                return 'NO_LINE', yellow_ratio
-            return 'LINE', yellow_ratio
-        except Exception:
-            return 'LINE', 0.0
+def _classify_scene(self, image):
+    """Quick heuristic to decide scene type using yellow-paint ratio.
 
-    def _handle_line(self, image, no_yellow=False):
-        """Detect the bright/grayscale center line and return (x, confidence).
+    Returns (scene_str, yellow_ratio).
+    - 'CROSSWALK' when a large fraction of the scene contains yellow
+        (crosswalk markings).
+    - 'NO_LINE' when very little yellow is present.
+    - 'LINE' otherwise.
+    """
+    try:
+        h, w = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        yellow_lower = np.array([15, 100, 100])
+        yellow_upper = np.array([35, 255, 255])
+        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+        yellow_ratio = float(np.sum(yellow_mask > 0)) / float(max(1, h * w))
+        if yellow_ratio > 0.25:
+            return 'CROSSWALK', yellow_ratio
+        if yellow_ratio < 0.07:
+            return 'NO_LINE', yellow_ratio
+        return 'LINE', yellow_ratio
+    except Exception:
+        return 'LINE', 0.0
 
-        `no_yellow` True disables acceptance of a confident bright peak.
-        """
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            gray = cv2.medianBlur(gray, 3)
-            gray = cv2.equalizeHist(gray)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+def _handle_line(self, image, no_yellow=False):
+    """Detect the lane center using a smoothed column brightness profile.
 
-            column_means = np.mean(blurred, axis=0)
-            SMOOTH_K = 11
-            kernel = np.ones(SMOOTH_K) / SMOOTH_K
-            pad = SMOOTH_K // 2
-            padded = np.pad(column_means, pad, mode='reflect')
-            column_means_smooth = np.convolve(padded, kernel, mode='valid')
+    Returns (x, confidence). If `no_yellow` is True the detector avoids
+    accepting a very strong bright peak (useful for recovering when
+    yellow paint or reflections could be misleading).
+    """
+    try:
+        # Prepare a stable brightness signal
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 3)
+        gray = cv2.equalizeHist(gray)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-            max_idx = int(np.argmax(column_means_smooth))
-            max_val = column_means_smooth[max_idx]
+        # Column-wise average brightness
+        column_means = np.mean(blurred, axis=0)
 
-            if max_val > 30:
-                window = 40
-                start = max(0, max_idx - window)
-                end = min(column_means_smooth.shape[0] - 1, max_idx + window)
-                if end > start:
-                    local_avg = np.mean(column_means_smooth[start:end])
-                    if max_val > local_avg * 1.15:
-                        if no_yellow:
-                            pass
-                        else:
-                            return max_idx, True
+        # Smooth the 1D signal to avoid single-pixel noise creating
+        # false peaks. Kernel size is small relative to image width.
+        SMOOTH_K = 11
+        kernel = np.ones(SMOOTH_K) / SMOOTH_K
+        pad = SMOOTH_K // 2
+        padded = np.pad(column_means, pad, mode='reflect')
+        column_means_smooth = np.convolve(padded, kernel, mode='valid')
 
-            # Weak peak: try searching near the last known center
-            search_center = self.last_known_road_center
-            search_window = 180
-            start = max(0, search_center - search_window // 2)
-            end = min(column_means_smooth.shape[0] - 1, search_center + search_window // 2)
+        max_idx = int(np.argmax(column_means_smooth))
+        max_val = column_means_smooth[max_idx]
+
+        # A strong peak relative to nearby values indicates a confident
+        # lane marking. Thresholds here are intentionally conservative.
+        if max_val > 30:
+            window = 40
+            start = max(0, max_idx - window)
+            end = min(column_means_smooth.shape[0] - 1, max_idx + window)
             if end > start:
-                local_max = np.argmax(column_means_smooth[start:end]) + start
-                if column_means_smooth[local_max] > 20:
-                    return local_max, False
+                local_avg = np.mean(column_means_smooth[start:end])
+                if max_val > local_avg * 1.15:
+                    if no_yellow:
+                        # In relaxed/no-yellow mode we don't accept
+                        # very strong bright peaks as confident.
+                        pass
+                    else:
+                        return max_idx, True
 
-            return image.shape[1] // 2, False
-        except Exception:
-            return image.shape[1] // 2, False
+        # Weak peak: attempt a localized search near the last known
+        # center to recover from partial occlusions or faded markings.
+        search_center = self.last_known_road_center
+        search_window = 180
+        start = max(0, search_center - search_window // 2)
+        end = min(column_means_smooth.shape[0] - 1, search_center + search_window // 2)
+        if end > start:
+            local_max = np.argmax(column_means_smooth[start:end]) + start
+            if column_means_smooth[local_max] > 20:
+                # Found a weaker but plausible center
+                return local_max, False
 
-    def calculate_pid(self, road_center, confidence):
-        """PID controller for lateral error (in pixels).
+        # No reliable detection: return image center and mark as
+        # unconfident so the controller avoids active corrections.
+        return image.shape[1] // 2, False
+    except Exception:
+        return image.shape[1] // 2, False
 
-        Behavior notes:
-          - `road_center` and `image_center` are pixel coordinates.
-          - When `confidence` is False the controller zeros `Kp/Ki/Kd`
-            (effective gains) or resets integral/derivative state to avoid
-            steering from unreliable measurements.
-          - The integral term is clamped by `integral_max` to limit bias.
-        """
+def calculate_pid(self, road_center, confidence):
+    """PID controller for lateral error (in pixels).
 
-        # If ambiguous and centered, explicitly return zero steering
-        if road_center == 256 and not confidence:
-            return 0.0
+    Args:
+        road_center: Detected center x-coordinate (pixels).
+        confidence: Boolean indicating whether detection is considered
+                    reliable. When False the controller reduces gains and
+                    resets integral/derivative state to avoid windup.
 
-        image_center = 256
-        current_time = time.time()
-        dt = max(0.001, min(current_time - self.prev_time, 0.1))
+    Returns:
+        Steering command (float) clamped to [-self.max_steering, self.max_steering].
+    """
 
-        # instantaneous lateral error in pixels
-        error = road_center - image_center
-        filtered_error = error
+    # If the vehicle is centered and the detection is unconfident,
+    # explicitly avoid sending a steering command.
+    if road_center == self.image_center and not confidence:
+        return 0.0
 
-        # Use Kp only when detection is confident
-        Kp_eff = self.Kp if confidence else 0.0
-        P = Kp_eff * filtered_error
+    image_center = self.image_center
+    current_time = time.time()
+    dt = max(0.001, min(current_time - self.prev_time, 0.1))
 
-        # reset on loss of confidence (prevent windup/spikes)
-        if not confidence and self.prev_confidence:
-            self.integral = 0.0
-            self.prev_error = 0.0
+    # Lateral error (pixels): positive means center is to the right.
+    error = road_center - image_center
+    filtered_error = error
 
-        Ki_eff = self.Ki if confidence else 0.0
-        Kd_eff = self.Kd if confidence else 0.0
-        integral_gain = 1.0 if confidence else 0.0
-        self.integral += filtered_error * dt * integral_gain
-        self.integral = max(-self.integral_max, min(self.integral_max, self.integral))
-        I = Ki_eff * self.integral
+    # Effective proportional gain depends on detection confidence.
+    Kp_eff = self.Kp if confidence else 0.0
+    P = Kp_eff * filtered_error
 
-        if dt > 0.01:
-            derivative = (filtered_error - self.prev_error) / dt
-            derivative = np.clip(derivative, -15, 15)
-            D = Kd_eff * derivative
-        else:
-            derivative = 0.0
-            D = 0.0
+    # On transition to unconfident, reset integral/derivative to avoid
+    # windup and sudden corrective actions.
+    if not confidence and self.prev_confidence:
+        self.integral = 0.0
+        self.prev_error = 0.0
 
-        steering = P + I + D
-        steering = max(-self.max_steering, min(self.max_steering, steering))
+    Ki_eff = self.Ki if confidence else 0.0
+    Kd_eff = self.Kd if confidence else 0.0
+    integral_gain = 1.0 if confidence else 0.0
+    self.integral += filtered_error * dt * integral_gain
+    self.integral = max(-self.integral_max, min(self.integral_max, self.integral))
+    I = Ki_eff * self.integral
 
-        # Force zero steering when detection is not confident to avoid
-        # acting on unreliable measurements (actuator dynamics may still
-        # carry the vehicle, but no new steering command is issued).
-        if not confidence:
-            steering = 0.0
+    if dt > 0.01:
+        derivative = (filtered_error - self.prev_error) / dt
+        derivative = np.clip(derivative, -15, 15)
+        D = Kd_eff * derivative
+    else:
+        derivative = 0.0
+        D = 0.0
 
-        # update state
-        self.prev_error = filtered_error
-        self.prev_time = current_time
-        self.prev_confidence = confidence
+    steering = P + I + D
+    steering = max(-self.max_steering, min(self.max_steering, steering))
 
-        return steering
+    # When detection is unreliable do not issue corrections; this keeps
+    # the actuator command neutral while preserving internal state.
+    if not confidence:
+        steering = 0.0
+
+    # Update controller state for the next iteration
+    self.prev_error = filtered_error
+    self.prev_time = current_time
+    self.prev_confidence = confidence
+
+    return steering
 
 
 def main(args=None):
