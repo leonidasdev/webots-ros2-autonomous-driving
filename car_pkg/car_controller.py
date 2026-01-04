@@ -138,9 +138,10 @@ class CarController(Node):
                 
         except (ValueError, IndexError):
             # If the `speed_limit` message does not include a numeric value,
-            # apply the lower default of speed limits in the system (55 internal units).
-            self.get_logger().info("SPEED_LIMIT without numeric value received: applying default 55")
-            self.max_speed = 55.0
+            # the detector must provide the value.
+            # Keep existing limits unchanged and log the event.
+            self.get_logger().info("SPEED_LIMIT without numeric value received: no change applied (detector should send explicit value)")
+            return
             
     def check_stop_timer(self):
         """Check whether the STOP duration has elapsed and resume if so."""

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-create_augmented.py - Generate targeted augmentations directly into `resources/`.
+create_augmented.py - generate simple augmentations into `resources/`.
 
-This script creates varied augmented templates (rotation, scale, brightness,
-noise, small occlusions) and saves them into the existing `resources/` folder
-using the `_aug_` filename pattern so `sign_detector` will keep using them.
+This script produces scale variants of the
+original color templates and writes color copies into
+the `resources/` folder using the `_aug_` filename pattern. The detector
+expects these pre-scaled templates so no runtime resizing is necessary.
 
 Usage:
     python create_augmented.py
@@ -14,56 +15,19 @@ import os
 import re
 import cv2
 import numpy as np
-from random import choice, uniform, randint, seed
+from random import choice, seed
 
+def transform_image(img, scale=1.0):
+    """Apply isotropic scaling (about the center).
 
-def adjust_brightness_contrast(img, alpha=1.0, beta=0):
-    # alpha: contrast (1.0 = no change), beta: brightness (0 = no change)
-    img2 = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
-    return img2
-
-
-def add_noise(img, sigma=5):
-    noise = np.random.normal(0, sigma, img.shape).astype(np.int16)
-    img_i = img.astype(np.int16) + noise
-    img_i = np.clip(img_i, 0, 255).astype(np.uint8)
-    return img_i
-
-
-def random_occlusion(img, max_frac=0.12):
+    For canonical augmented images we write the original-sized image; the
+    explicit scaled templates are written separately by resizing the
+    canonical image to the desired `output_scales`.
+    """
     h, w = img.shape[:2]
-    occ_w = int(w * uniform(0.03, max_frac))
-    occ_h = int(h * uniform(0.03, max_frac))
-    x = randint(0, max(0, w - occ_w))
-    y = randint(0, max(0, h - occ_h))
-    color = tuple([int(uniform(0, 255)) for _ in range(3)])
-    img2 = img.copy()
-    cv2.rectangle(img2, (x, y), (x + occ_w, y + occ_h), color, -1)
-    return img2
-
-
-def transform_image(img, rotate_deg=0.0, scale=1.0, brightness=1.0, beta=0, noise_sigma=0, occlude=False):
-    h, w = img.shape[:2]
-
-    # Scale + rotate around center
-    M_scale = cv2.getRotationMatrix2D((w/2, h/2), 0, scale)
+    M_scale = cv2.getRotationMatrix2D((w/2, h/2), 0, float(scale))
     img_s = cv2.warpAffine(img, M_scale, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    M = cv2.getRotationMatrix2D((w/2, h/2), rotate_deg, 1.0)
-    img_r = cv2.warpAffine(img_s, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    # Brightness/contrast
-    img_bc = adjust_brightness_contrast(img_r, alpha=brightness, beta=beta)
-
-    # Noise
-    if noise_sigma > 0:
-        img_bc = add_noise(img_bc, sigma=noise_sigma)
-
-    # Occlusion
-    if occlude:
-        img_bc = random_occlusion(img_bc)
-
-    return img_bc
+    return img_s
 
 
 def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
@@ -75,7 +39,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         input_dir = os.path.join(script_dir, 'resources')
 
-    # Marker file to skip repeated augmentation
+    # Marker file prevents re-running augmentation on every launch
     marker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.aug_done')
     if os.path.exists(marker_path):
         print('Augmentations already created (marker found). Skipping generation.')
@@ -97,12 +61,8 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
     print(f"Found {len(originals)} original templates. Generating up to {max_per_image} variants each...")
 
-    # Parameter pools
-    rotations = [-15, -10, -5, 0, 5, 10, 15]
-    scales = [0.8, 0.9, 1.0, 1.1, 1.2]
-    brightnesss = [0.8, 0.9, 1.0, 1.1, 1.25]
-    beta_vals = [-30, -15, 0, 15, 30]
-    noise_options = [0, 3, 6, 10]
+    # Parameter pools: only scaling. Keep color.
+    output_scales = [1.0, 1.1, 1.2, 1.3, 0.9, 0.8]
 
     for fname in originals:
         path = os.path.join(input_dir, fname)
@@ -112,7 +72,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
             continue
 
         name, ext = os.path.splitext(fname)
-        # Determine existing augmented files for this base name
+        # Find existing augmented variants for this base filename
         all_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         existing_aug = [f for f in all_files if f.startswith(f"{name}_aug_") and f.lower().endswith(ext.lower())]
 
@@ -131,21 +91,12 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
         need = max_per_image - len(existing_indices)
 
-        # Create variants pool (deterministic + random) and select only 'need' of them
-        variants = []
-        for rot in rotations[:3]:
-            for sc in scales[:3]:
-                variants.append((rot, sc, 1.0, 0, 0, False))
-        while len(variants) < max_per_image:
-            rot = choice(rotations)
-            sc = choice(scales)
-            br = choice(brightnesss)
-            beta = choice(beta_vals)
-            noise = choice(noise_options)
-            occ = (randint(0, 4) == 0)
-            variants.append((rot, sc, br, beta, noise, occ))
+        # We don't create additional canonical photometric variants here;
+        # the scaled templates (below) provide the size diversity used at
+        # detection time. We'll create up to `max_per_image` canonical
+        # copies (identical to original) named with distinct indices.
 
-        # Find free indices to assign
+        # Find available indices to name new augmented files
         free_indices = []
         idx = 0
         while len(free_indices) < need:
@@ -153,24 +104,42 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
                 free_indices.append(idx)
             idx += 1
 
-        # Generate only the required number of variants and assign to free indices
+        # Generate required number of variants and assign to free indices
         created_this = 0
-        for out_idx, params in zip(free_indices, variants):
-            rot, sc, br, beta, noise, occ = params
+        # Skip indices known to produce problematic variants
+        skip_indices = {13, 18}
+        for out_idx in free_indices:
+            if out_idx in skip_indices:
+                print(f"  Skipping problematic augmentation index {out_idx} for {name}")
+                continue
             aug_name = f"{name}_aug_{out_idx}{ext}"
             aug_path = os.path.join(input_dir, aug_name)
             if os.path.exists(aug_path):
                 skipped += 1
                 continue
 
-            out = transform_image(img, rotate_deg=rot, scale=sc, brightness=br, beta=beta, noise_sigma=noise, occlude=occ)
+            # Save canonical copy (no photometric changes)
+            out = img.copy()
             h, w = img.shape[:2]
-            if out.shape[0] != h or out.shape[1] != w:
-                out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
-
             cv2.imwrite(aug_path, out)
             created += 1
             created_this += 1
+
+            # Write scaled-template files so the detector can load pre-scaled
+            # templates without runtime resizing.
+            for out_scale in output_scales:
+                scaled_h = max(8, int(h * out_scale))
+                scaled_w = max(8, int(w * out_scale))
+                try:
+                    scaled = cv2.resize(out, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+                    scale_name = f"{name}_aug_{out_idx}_scale{int(out_scale*100)}{ext}"
+                    scale_path = os.path.join(input_dir, scale_name)
+                    # Avoid overwriting if already present
+                    if not os.path.exists(scale_path):
+                        cv2.imwrite(scale_path, scaled)
+                        created += 1
+                except Exception:
+                    continue
 
         print(f"  {fname}: created {created_this} new variants (existing: {len(existing_indices)})")
 
@@ -180,7 +149,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
     print(f"  resources folder: {input_dir}/")
     print("Note: Files use the '_aug_' naming pattern and will be loaded by sign_detector from resources/")
 
-    # create marker file so subsequent launches skip regeneration
+    # Create marker file to skip regeneration on future runs
     try:
         with open(marker_path, 'w') as f:
             f.write('done')
