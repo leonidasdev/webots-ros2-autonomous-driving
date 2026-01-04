@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """create_augmented.py - generate pre-scaled color templates in resources/.
 
 This script creates canonical color copies of original templates and
@@ -7,7 +8,7 @@ the package `resources/` folder. The detector loads these pre-generated
 templates so no runtime resizing is required.
 
 Usage:
-    python create_augmented.py
+    python create_augmented.py (also invoked by launch/launch.py)
 """
 
 import os

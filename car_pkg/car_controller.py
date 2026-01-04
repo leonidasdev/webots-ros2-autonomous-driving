@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 
+"""Car controller node: apply speed commands based on detected signs.
+
+This node subscribes to `/traffic_sign` (std_msgs/String) and `/control/steering`
+and publishes speed commands to `/control/speed` (std_msgs/Float32).
+
+Behavior rules implemented:
+- `base_speed` is the nominal default and initializes `max_speed`.
+- `yield` halves the effective maximum speed (modifier only).
+- `speed_limit_N` sets the nominal `max_speed` to N.
+- `stop` halts motion for `stop_duration` seconds, then resumes toward
+    the effective maximum.
+
+The node prefers simulated time (via `get_clock().now().nanoseconds`) for
+accurate STOP timing when available, with a wall-clock fallback.
+"""
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32, String
@@ -30,9 +46,11 @@ class CarController(Node):
         # Use simulation clock nanoseconds for accurate sim-time STOP timing.
         # Stored as integer nanoseconds. Fallback to wall-clock if needed.
         self.stop_start_time_ns = 0
-        self.stop_duration = 1.0
+        # TODO For testing we use 3 seconds stop; change to 1.0 for production
+        self.stop_duration = 3.0
         
         # Yield state
+        # When True the effective maximum speed is halved
         self.yield_speed_active = False
         
         # Subscribers
@@ -56,7 +74,7 @@ class CarController(Node):
         self._speed_step_per_sec = 1.0 / 0.05
         self.speed_step = self._speed_step_per_sec * self.control_dt
         
-        self.get_logger().info("Car Controller iniciado")
+        self.get_logger().info("Car Controller started")
         
     def steering_callback(self, msg):
         """Receive steering commands from the road follower."""
@@ -76,11 +94,10 @@ class CarController(Node):
             self.last_sign = sign_data
             self.last_sign_time = current_time
 
-            # Override yield: enable only if the new sign is a yield, otherwise disable
-            if sign_data.startswith('yield'):
-                self.yield_speed_active = True
-            else:
-                self.yield_speed_active = False
+            # Yield is a transient modifier: active only while the last seen
+            # sign is a `yield`. The effective max speed will be computed from
+            # `self.max_speed` and the `yield` flag (halved when active).
+            self.yield_speed_active = sign_data.startswith('yield')
 
             # Process the sign
             self.handle_traffic_sign()
@@ -98,10 +115,15 @@ class CarController(Node):
             self.handle_speed_limit()
             
     def handle_yield(self):
-        """Handle YIELD: enable reduced max speed (half base)."""
+        """Handle YIELD: mark yield active so effective max is halved.
+
+        The halving is applied dynamically when computing the effective
+        maximum speed; we do not mutate the sign-provided `self.max_speed`
+        so that subsequent `speed_limit` signs can update the nominal
+        limit and the yield modifier will apply on top of it.
+        """
         self.yield_speed_active = True
-        self.max_speed = self.base_speed / 2.0
-        self.get_logger().info(f"YIELD received: max_speed set to {self.max_speed}")
+        self.get_logger().info("YIELD received: effective max speed will be halved")
         
     def handle_stop(self):
         """Handle STOP: stop for configured duration."""
@@ -113,8 +135,9 @@ class CarController(Node):
         except Exception:
             # Fallback: store wall-clock time as nanoseconds
             self.stop_start_time_ns = int(time.time() * 1e9)
-        # Disable yield once stopped
-        self.yield_speed_active = False
+        # Do not change yield state on STOP. When resuming the controller
+        # will move toward the effective max speed which already accounts
+        # for a possible active `yield`.
         # Detect whether simulated time appears active. Prefer the explicit
         # `use_sim_time` parameter if set; otherwise look for a `/clock` topic.
         sim_time_active = False
@@ -134,28 +157,35 @@ class CarController(Node):
         self.get_logger().info(f"STOP received: stopping for {self.stop_duration}s (sim_time={'ON' if sim_time_active else 'OFF'})")
         
     def handle_speed_limit(self):
-        """Handle SPEED_LIMIT: parse and apply new max speed."""
+        """Handle `speed_limit_N`: parse numeric value and apply nominal max.
+
+        The nominal `self.max_speed` is updated; the effective maximum used
+        by the controller considers the `yield` modifier separately.
+        """
         try:
-            # Extraer número de velocidad
+            # Extract numeric speed value from the message `speed_limit_N`.
             parts = self.last_sign.split('_')
             speed_number = int(parts[-1])
 
-            # Store limit in internal units (e.g. km/h-like). Conversion to
-            # motor/simulator units is applied when publishing.
-            self.max_speed = speed_number
+            # Store nominal maximum speed (internal units). Conversion to
+            # simulator motor units is applied when publishing.
+            # Set nominal maximum speed (from sign payload).
+            self.max_speed = float(speed_number)
             
-            # Limitar valores razonables
+            # Clamp to reasonable bounds
             if self.max_speed < 10:
                 self.max_speed = 10
             elif self.max_speed > 100:
                 self.max_speed = 100
                 
-            # Disable yield when a speed limit is explicitly set
-            self.yield_speed_active = False
-                
-            # If not stopped, ensure current speed does not exceed the new limit
+            # Do not change the yield modifier here; it is applied on top of
+            # the nominal `max_speed`. If currently stopped, the resume will
+            # move toward the effective maximum when the stop ends.
+            # If not stopped, ensure current speed does not exceed the
+            # effective maximum (taking yield into account).
             if not self.is_stopped:
-                self.current_speed = min(self.current_speed, self.max_speed)
+                eff = self.get_effective_max()
+                self.current_speed = min(self.current_speed, eff)
             self.get_logger().info(f"SPEED_LIMIT received: set max_speed to {self.max_speed}")
                 
         except (ValueError, IndexError):
@@ -185,12 +215,24 @@ class CarController(Node):
             except Exception:
                 pass
         
+    def get_effective_max(self):
+        """Return the effective maximum speed, accounting for `yield`.
+
+        The nominal `self.max_speed` is set by `speed_limit` signs or by
+        the `base_speed`. When `yield` is active the effective maximum is
+        halved (with a sensible lower bound).
+        """
+        eff = float(self.max_speed)
+        if self.yield_speed_active:
+            eff = max(10.0, eff / 2.0)
+        return eff
+        
     def resume_after_stop(self):
         """Resume motion after STOP: restore appropriate current speed with the max speed."""
         self.is_stopped = False
-
-        self.current_speed = self.max_speed
-        self.get_logger().info(f"Resuming after STOP: max_speed={self.max_speed}, current_speed={self.current_speed}")
+        # Resume toward the effective maximum (accounts for yield).
+        self.current_speed = self.get_effective_max()
+        self.get_logger().info(f"Resuming after STOP: max_speed={self.max_speed}, yield_active={self.yield_speed_active}, current_speed={self.current_speed}")
         
     def control_loop(self):
         """Main control loop: maintain speed and publish controls."""
@@ -201,10 +243,12 @@ class CarController(Node):
 
         if not self.is_stopped:
             # Smoothly move current_speed toward max_speed
-            if self.current_speed > self.max_speed:
-                self.current_speed = max(self.max_speed, self.current_speed - self.speed_step)
-            elif self.current_speed < self.max_speed:
-                self.current_speed = min(self.max_speed, self.current_speed + self.speed_step)
+            # Target is the effective maximum which considers yield.
+            eff_max = self.get_effective_max()
+            if self.current_speed > eff_max:
+                self.current_speed = max(eff_max, self.current_speed - self.speed_step)
+            elif self.current_speed < eff_max:
+                self.current_speed = min(eff_max, self.current_speed + self.speed_step)
 
             # Publish converted speed for Webots
             speed_msg = Float32()
