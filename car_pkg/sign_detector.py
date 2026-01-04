@@ -32,9 +32,9 @@ class SignDetector(Node):
         self.base_templates = self.load_base_templates()
         # Template-only detector thresholds (matchTemplate thresholds)
         self.template_thresholds = {
-            'stop': 0.40,
-            'yield': 0.40,
-            'speed_limit': 0.45
+            'stop': 0.60,
+            'yield': 0.70,
+            'speed_limit': 0.60
         }
         # Minimum gap required between best and second-best match to accept detection
         self.match_gap = 0.04
@@ -156,38 +156,25 @@ class SignDetector(Node):
                 cooldown = self.cooldowns.get(base_sign_type, 1.0)
                 
                 if time_since_last > cooldown or detected_sign != self.last_sign_detected:
-                    # Log detection with per-cue confidences when available
-                    # Detection logging disabled to reduce runtime noise
-                    # if debug:
-                    #     s_conf = debug.get('shape', 0.0)
-                    #     c_conf = debug.get('color', 0.0)
-                    #     t_conf = debug.get('template', 0.0)
-                    #     bbox = debug.get('bbox')
-                    #     self.get_logger().info(
-                    #         f"Señal detectada: {detected_sign} ({confidence:.3f}) "
-                    #         f"shape={s_conf:.3f} color={c_conf:.3f} template={t_conf:.3f} bbox={bbox}"
-                    #     )
-                    # else:
-                    #     self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence:.3f})")
                     
-                        self.last_sign_detected = detected_sign
-                        self.last_detection_time = current_time
+                    self.last_sign_detected = detected_sign
+                    self.last_detection_time = current_time
 
-                        # Log detection with confidence percentage and template info
-                        try:
-                            if debug:
-                                tpl = debug.get('template_key')
-                                bbox = debug.get('bbox')
-                                self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%) template={tpl} bbox={bbox}")
-                            else:
-                                self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%)")
-                        except Exception:
-                            pass
+                    # Log detection with confidence percentage and template info
+                    try:
+                        if debug:
+                            tpl = debug.get('template_key')
+                            bbox = debug.get('bbox')
+                            self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%) template={tpl} bbox={bbox}")
+                        else:
+                            self.get_logger().info(f"Señal detectada: {detected_sign} ({confidence*100:.1f}%)")
+                    except Exception:
+                        pass
 
-                        sign_msg = String()
-                        sign_msg.data = detected_sign
-                        self.sign_pub.publish(sign_msg)
-                
+                    sign_msg = String()
+                    sign_msg.data = detected_sign
+                    self.sign_pub.publish(sign_msg)
+            
         except Exception as e:
             self.get_logger().error(f"Error procesando imagen: {str(e)}")
 
@@ -213,7 +200,7 @@ class SignDetector(Node):
         best_key = None
         second_best = 0.0
 
-        # Iterate over all loaded templates (no grouping/prefilter)
+        # Iterate over all loaded templates
         for template_key, template_dict in self.base_templates.items():
                 template_bgr = template_dict.get('bgr')
                 if template_bgr is None:
