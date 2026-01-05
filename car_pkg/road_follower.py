@@ -2,9 +2,21 @@
 
 """Road follower node: detect lane/road center and publish steering.
 
-This node subscribes to `/road_camera/image` (sensor_msgs/Image), finds a
-lateral road center using a lightweight column-intensity approach, and
-publishes steering commands (std_msgs/Float32) to `/control/steering`.
+Subscriptions:
+- `/road_camera/image` (sensor_msgs/Image): camera frames used for
+    lane/road-center detection.
+
+Publications:
+- `/control/steering` (std_msgs/Float32): steering command published
+    as a single float (simulator/motor steering units).
+
+Summary:
+This node finds a lateral road center using a lightweight
+column-intensity approach, converts pixel error to a steering command
+via a simple PID controller, and publishes the command. The node is
+designed to be robust in simulation: it avoids integral windup when
+detections are unreliable and falls back to recent confident
+detections for short outages.
 
 Design goals:
 - Keep the detector simple and robust for a simulation environment.
@@ -20,10 +32,10 @@ unwanted steering from noisy measurements.
 import rclpy
 from rclpy.node import Node
 import numpy as np
-from sensor_msgs.msg import Image
+import cv2
 from cv_bridge import CvBridge
 from std_msgs.msg import Float32
-import cv2
+from sensor_msgs.msg import Image
 import time
 
 
@@ -43,9 +55,11 @@ class RoadFollower(Node):
         super().__init__('road_follower')
         self.bridge = CvBridge()
 
-        # ROS topics
-        self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
+        # Publishers
         self.steering_pub = self.create_publisher(Float32, '/control/steering', 10)
+        
+        # Subscribers
+        self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
 
         # Image center (pixels). Many simulator frames are 512 px wide; store
         # a default here for cases where image metadata isn't available.
