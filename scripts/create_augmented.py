@@ -68,13 +68,16 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
     seed(seed_val)
     np.random.seed(seed_val)
 
-    # Resolve input_dir relative to the script location when not provided
+    # Resolve input_dir relative to the script location when not provided.
+    # The script lives in `scripts/`, while `resources/` is one level
+    # up in the package. Use the parent `resources/` path by default.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if input_dir is None:
-        input_dir = os.path.join(script_dir, 'resources')
+        input_dir = os.path.normpath(os.path.join(script_dir, '..', 'resources'))
 
-    # Marker file prevents re-running augmentation on every launch
-    marker_path = os.path.join(script_dir, '.aug_done')
+    # Marker file prevents re-running augmentation on every launch. Place
+    # the marker inside the `resources/` folder so it travels with templates.
+    marker_path = os.path.join(input_dir, '.aug_done')
     if os.path.exists(marker_path):
         print('Augmentations already created (marker found). Skipping generation.')
         return

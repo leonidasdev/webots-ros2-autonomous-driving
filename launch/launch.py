@@ -32,8 +32,8 @@ def generate_launch_description():
     `start_webots` launch argument.
     """
 
-    # Path to the augmentation helper inside the package
-    script_path = os.path.join(get_package_share_directory('car_pkg'), 'create_augmented.py')
+    # Path to the augmentation helper inside the package (now under scripts/)
+    script_path = os.path.join(get_package_share_directory('car_pkg'), 'scripts', 'create_augmented.py')
 
     pre_generate = ExecuteProcess(cmd=[sys.executable, script_path], output='screen')
 

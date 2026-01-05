@@ -20,8 +20,11 @@ setup(
         # Launch files
         (os.path.join('share', package_name, 'launch'), 
          glob('launch/*.launch.py') + glob('launch/*.py')),
-        # Augmentation script
-        (os.path.join('share', package_name), ['create_augmented.py']),
+        
+        # Augmentation script (moved into package `scripts/`)
+        (os.path.join('share', package_name, 'scripts'), ['scripts/create_augmented.py']),
+        
+        # World files
         (os.path.join('share', package_name, 'world'), glob('world/*')),
     ],
     install_requires=['setuptools', 'opencv-python', 'numpy'],
