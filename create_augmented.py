@@ -29,7 +29,7 @@ import os
 import re
 import cv2
 import numpy as np
-from random import choice, seed
+from random import seed
 
 
 def transform_image(img, scale=1.0):
