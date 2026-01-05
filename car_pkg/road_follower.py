@@ -54,13 +54,13 @@ class RoadFollower(Node):
     def __init__(self):
         super().__init__('road_follower')
         self.bridge = CvBridge()
-
         # Publishers
         self.steering_pub = self.create_publisher(Float32, '/control/steering', 10)
-        
+
         # Subscribers
         self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
 
+        # --- Detection / image parameters and persistence state ---
         # Image center (pixels). Many simulator frames are 512 px wide; store
         # a default here for cases where image metadata isn't available.
         self.image_center = 256
@@ -68,20 +68,24 @@ class RoadFollower(Node):
         # Last observed centers and persistence counters used to smooth
         # behavior when detections are weak or temporarily missing.
         self.last_known_road_center = self.image_center
+        self.last_confident_center = self.image_center
         self.no_line_persist_counter = 0
         # Number of consecutive frames to reuse last confident center
         # before attempting fresh recovery. At ~30 FPS, 15 frames ≈ 0.5 s.
         self.no_line_persist_max = 15
-        self.last_confident_center = self.image_center
 
+        # --- PID controller configuration and state (operates on pixels) ---
         # PID tuning (operates on pixel error). Values were chosen to be
         # conservative for the simulator; tune as needed in-sim.
         self.Kp = 0.005
         self.Ki = 0.0003
         self.Kd = 0.0002
+
+        # Controller state
         self.integral = 0.0
         self.prev_error = 0.0
         self.prev_time = time.time()
+
         # Clamp for integral term to limit long-term bias
         self.integral_max = 100.0
         # Maximum absolute steering command (radians or simulator units)
@@ -92,11 +96,15 @@ class RoadFollower(Node):
         self.prev_confidence = True
 
     def image_callback(self, msg):
-        """ROS subscriber callback: convert image and run the pipeline.
+        """Handle incoming camera frames, detect road center, and publish steering.
 
-        Receives a `sensor_msgs/Image`, converts it to an OpenCV BGR image,
-        runs detection, computes steering via the PID controller, and
-        publishes a `std_msgs/Float32` with the steering command.
+        Args:
+            msg (sensor_msgs.msg.Image): ROS image message from the road camera.
+
+        The callback converts the ROS image to an OpenCV image, runs the
+        detection pipeline to obtain a road center and a confidence flag,
+        computes a steering command with the PID controller, and publishes
+        the command as a `std_msgs/Float32` message.
         """
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -116,16 +124,18 @@ class RoadFollower(Node):
             self.get_logger().error(f"Error processing image: {e}")
 
     def follow_road(self, image):
-        """Top-level detection pipeline.
+        """Top-level detection pipeline: classify scene and detect center.
+
+        Args:
+            image (numpy.ndarray): BGR image array from the camera.
 
         Returns:
-            (road_center_x, confidence)
+            tuple: (road_center_x (int), confidence (bool)).
 
-        The pipeline first classifies the scene then delegates to handlers
-        that implement recovery strategies for missing or ambiguous lane
-        markings. When confidence is False the returned center should be
-        treated as advisory and the controller will avoid aggressive
-        corrections.
+        The method first classifies the scene (LINE / NO_LINE / CROSSWALK)
+        and then uses detection or recovery strategies. When `confidence`
+        is False the returned center is advisory and the controller will
+        reduce corrective action.
         """
         image_center = image.shape[1] // 2
         try:
@@ -166,12 +176,17 @@ class RoadFollower(Node):
             return image_center, False
 
     def _classify_scene(self, image):
-        """Quick heuristic to decide scene type using yellow-paint ratio.
+        """Classify scene type using a heuristic yellow-paint ratio.
 
-        Returns (scene_str, yellow_ratio).
-        - 'CROSSWALK' when a large fraction of the scene contains yellow
-            (crosswalk markings).
-        - 'NO_LINE' when very little yellow is present.
+        Args:
+            image (numpy.ndarray): BGR image array from the camera.
+
+        Returns:
+            tuple: (scene_str (str), yellow_ratio (float)).
+
+        Scene labels:
+        - 'CROSSWALK' when a large fraction of the image contains yellow.
+        - 'NO_LINE' when there is very little yellow present.
         - 'LINE' otherwise.
         """
         try:
@@ -190,11 +205,21 @@ class RoadFollower(Node):
             return 'LINE', 0.0
 
     def _handle_line(self, image, no_yellow=False):
-        """Detect the lane center using a smoothed column brightness profile.
+        """Detect lane center via smoothed column brightness and heuristics.
 
-        Returns (x, confidence). If `no_yellow` is True the detector avoids
-        accepting a very strong bright peak (useful for recovering when
-        yellow paint or reflections could be misleading).
+        Args:
+            image (numpy.ndarray): BGR image array from the camera.
+            no_yellow (bool): If True, be conservative about accepting
+                              very strong bright peaks (used during
+                              relaxed recovery passes).
+
+        Returns:
+            tuple: (x (int), confidence (bool)).
+
+        The detector computes a 1D brightness profile across image columns,
+        smooths it, and selects the dominant peak as a candidate lane
+        center. If the peak is weak the method performs a localized
+        search near the last known center to recover from partial occlusions.
         """
         try:
             # Prepare a stable brightness signal
@@ -255,13 +280,14 @@ class RoadFollower(Node):
         """PID controller for lateral error (in pixels).
 
         Args:
-            road_center: Detected center x-coordinate (pixels).
-            confidence: Boolean indicating whether detection is considered
-                        reliable. When False the controller reduces gains and
-                        resets integral/derivative state to avoid windup.
+            road_center (int): Detected center x-coordinate (pixels).
+            confidence (bool): Whether detection is considered reliable.
+                When False the controller reduces gains and resets
+                integral/derivative state to avoid windup.
 
         Returns:
-            Steering command (float) clamped to [-self.max_steering, self.max_steering].
+            float: Steering command clamped to
+                [-self.max_steering, self.max_steering].
         """
 
         # If the vehicle is centered and the detection is unconfident,

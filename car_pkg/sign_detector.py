@@ -2,57 +2,36 @@
 
 """Sign detector node using template matching.
 
-This module implements a lightweight template-matching based traffic-sign
-detector for the Webots + ROS2 exercise. It loads pre-generated color
-templates from the package `resources/` folder and scans incoming camera
-frames using OpenCV's `matchTemplate` (TM_CCOEFF_NORMED).
+This module implements a template-matching based traffic-sign detector
+for Webots + ROS2. It loads templates from the package `resources/`
+folder and scans incoming camera frames using OpenCV's matchTemplate.
 
-The node publishes simple string tokens on `/traffic_sign` such as
-`stop`, `yield` or `speed_limit_50` which the controller consumes.
+Publishes string tokens on `/traffic_sign` such as `stop`, `yield` or
+`speed_limit` which the car_controller consumes.
 """
 
 import rclpy
 from rclpy.node import Node
 import cv2
-import numpy as np
+from cv_bridge import CvBridge
 import os
 import re
-from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 from std_msgs.msg import String
-import time
+from ament_index_python.packages import get_package_share_directory
 
 
 class SignDetector(Node):
-    """ROS2 node that detects traffic signs by template matching.
-
-    Behavior summary:
-    - Loads all image files from `resources/` (including pre-scaled `_scaleNN`
-      variants) into memory as BGR templates.
-    - For each incoming `/car_camera/image` frame, scans the full image with
-      each template using multi-channel BGR matching.
-    - Accepts a detection when the best match >= per-type threshold.
-    - Publishes a short string on `/traffic_sign` describing the sign.
-    """
+    """ROS2 node that detects traffic signs by template matching."""
 
     def __init__(self):
         super().__init__('sign_detector')
         self.bridge = CvBridge()
-
-        # Detection state and cooldowns
-        self.last_sign_detected = None
-        self.last_detection_time = 0
-        # Cooldowns (seconds) per sign family to avoid repeated publishes
-        self.cooldowns = {'stop': 2.0, 'yield': 2.0, 'speed_limit': 1.5}
-
-        # ROS communication
+        # --- ROS communication (publishers / subscribers) ---
         self.image_sub = self.create_subscription(Image, '/car_camera/image', self.image_callback, 10)
         self.sign_pub = self.create_publisher(String, '/traffic_sign', 10)
 
-        # Load templates from package resources (color BGR images)
-        self.base_templates = self.load_base_templates()
-
+        # --- Detection configuration ---
         # Per-type acceptance thresholds (TM_CCOEFF_NORMED)
         self.template_thresholds = {
             'stop': 0.60,
@@ -60,17 +39,28 @@ class SignDetector(Node):
             'speed_limit': 0.60
         }
 
-        # Previously we required a gap between best and second-best; the
-        # gap check is disabled by setting to 0.0 so ties are accepted.
-        self.match_gap = 0.0
+        # Cooldowns in frames (~30 FPS assumed)
+        self.cooldown_frames = {'stop': 60, 'yield': 60, 'speed_limit': 45}
 
-        # Used to rate-limit occasional debug/info logs
-        self._last_match_log_time = 0.0
+        # Load templates from package resources
+        self.base_templates = self.load_base_templates()
+
+        # --- Detection/runtime state ---
+        self.last_sign_detected = None
+        self.last_detection_frame = 0
+        self.frame_count = 0
+
+        self.get_logger().info(f"Sign Detector ready with {len(self.base_templates)} templates")
         
     def load_base_templates(self):
-        """Load sign templates from the package `resources/` folder.
+        """Load sign templates from the package resources folder.
 
-        Returns a dict mapping template keys to dicts with keys: 'bgr', 'h', 'w'.
+        Returns:
+            dict: Mapping template_key -> { 'bgr': np.ndarray, 'h': int, 'w': int }
+
+        The method attempts to read templates from the installed package
+        share directory and falls back to the workspace `resources/` copy
+        when the package is not installed.
         """
         templates = {}
         try:
@@ -129,10 +119,17 @@ class SignDetector(Node):
         return templates
     
     def determine_sign_type(self, filename):
-        """Determine the sign type from a template filename.
+        """Extract sign type and optional speed value from a filename.
 
-        Returns (sign_type, speed_value) where speed_value is a string
-        when a numeric speed is present in the filename (e.g. '50').
+        Args:
+            filename (str): Template filename (may include numbers/variants).
+
+        Returns:
+            tuple: (sign_type (str|None), speed_value (str|None)).
+
+        Examples:
+            'stop.png' -> ('stop', None)
+            'speed_limit_50.png' -> ('speed_limit', '50')
         """
         filename_lower = filename.lower()
         speed_value = None
@@ -149,19 +146,21 @@ class SignDetector(Node):
         return None, None
 
     def image_callback(self, msg):
-        """Process each incoming camera frame and publish detections."""
-        # Note: camera frames from Webots are 512x256 (w x h).
-        # Typical sign ROIs extracted by downstream logic are very small
-        # (about 22x27). The detector upscales tiny input frames to a
-        # MIN_WORKING_WIDTH so template matching has enough
-        # resolution to work reliably.
+        """Process incoming camera frames and publish detected signs.
+
+        Args:
+            msg (sensor_msgs.msg.Image): Image message from `/car_camera/image`.
+
+        The callback downsamples large frames for speed, runs the template
+        detection pipeline, enforces a per-sign cooldown, and publishes
+        detected sign tokens on `/traffic_sign`.
+        """
+        self.frame_count += 1
+        
         try:
-            current_time = time.time()
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            # Adaptive working width: only downscale very large frames to limit
-            # computation. Do not upscale full frames — instead we upscale tiny
-            # ROIs before template matching so small crops (e.g. 22x27) gain
-            # sufficient resolution without enlarging the whole image.
+            
+            # Adaptive working width: downscale large frames
             MAX_WORKING_WIDTH = 512
             h_orig, w_orig = cv_image.shape[:2]
             if w_orig > MAX_WORKING_WIDTH:
@@ -173,32 +172,41 @@ class SignDetector(Node):
                 scale = 1.0
                 small_img = cv_image
 
-            detected_sign, confidence, debug = self.detect_sign(small_img, original_image=cv_image, scale=scale)
+            detected_sign, confidence, _ = self.detect_sign(small_img, original_image=cv_image, scale=scale)
             
             if detected_sign:
-                time_since_last = current_time - self.last_detection_time
+                frames_since_last = self.frame_count - self.last_detection_frame
                 base_sign_type = detected_sign.split('_')[0]
-                cooldown = self.cooldowns.get(base_sign_type, 1.0)
+                cooldown = self.cooldown_frames.get(base_sign_type, 30)
                 
-                if time_since_last > cooldown or detected_sign != self.last_sign_detected:
-                    
+                # Publish if cooldown passed or sign changed
+                if frames_since_last > cooldown or detected_sign != self.last_sign_detected:
                     self.last_sign_detected = detected_sign
-                    self.last_detection_time = current_time
-
-
+                    self.last_detection_frame = self.frame_count
 
                     sign_msg = String()
                     sign_msg.data = detected_sign
                     self.sign_pub.publish(sign_msg)
+                    
+                    self.get_logger().info(f"Detected: {detected_sign} (conf={confidence:.2f})")
             
         except Exception as e:
             self.get_logger().error(f"Error processing image: {str(e)}")
 
     def detect_sign(self, image, original_image=None, scale=1.0):
-        """Template-only detection over the whole image.
+        """Detect traffic signs by scanning the image with templates.
 
-        Scans the full image with pre-generated templates (no color/edge/shape heuristics).
-        Returns (best_detection, best_confidence, debug_dict).
+        Args:
+            image (numpy.ndarray): BGR image to scan (may be downscaled).
+            original_image (numpy.ndarray, optional): Full-resolution image.
+            scale (float): Scale factor between `image` and `original_image`.
+
+        Returns:
+            tuple: (detection (str|None), confidence (float), debug_dict (dict|None)).
+
+        The method returns a detection string (e.g. 'stop', 'yield',
+        'speed_limit_50') when a template match exceeds the per-type
+        threshold; otherwise returns (None, 0.0, debug_info).
         """
         best_detection = None
         best_confidence = 0.0
@@ -214,7 +222,6 @@ class SignDetector(Node):
         img_h, img_w = img_bgr.shape[:2]
 
         best_key = None
-        second_best = 0.0
 
         # Iterate over all loaded templates
         for template_key, template_dict in self.base_templates.items():
@@ -241,19 +248,16 @@ class SignDetector(Node):
                     sign_type = template_key.split('_')[0]
 
                 thresh = self.template_thresholds.get(sign_type, 0.4)
-                # Update best/second-best trackers
+                # Update best tracker
                 if max_val > best_confidence:
-                    second_best = best_confidence
                     best_confidence = float(max_val)
                     best_key = template_key
                     # bbox in image coords
                     x, y = max_loc
                     bbox = (int(x), int(y), int(t_w), int(t_h))
                     best_debug = {'template_key': template_key, 'bbox': bbox, 'type': sign_type, 'template_val': float(max_val)}
-                elif max_val > second_best:
-                    second_best = float(max_val)
 
-        # Apply gap check to avoid ambiguous/weak matches
+        # Apply threshold check to avoid weak matches
         if best_key is None:
             # Silent: do not emit info logs when no templates match
             return None, 0.0, None
@@ -265,9 +269,8 @@ class SignDetector(Node):
             best_type = best_key.split('_')[0]
 
         thresh = self.template_thresholds.get(best_type, 0.4)
-        gap = best_confidence - second_best
 
-        if best_confidence >= thresh and gap >= self.match_gap:
+        if best_confidence >= thresh:
             # Create detection string
             if best_type == 'speed_limit' and 'speed_limit_' in best_key:
                 m = re.match(r'speed_limit_(\d+)', best_key)
@@ -276,12 +279,9 @@ class SignDetector(Node):
             else:
                 detection = best_type
 
-            # attach second_best for debugging
-            if best_debug is not None:
-                best_debug['second_best'] = float(second_best)
             return detection, best_confidence, best_debug
 
-        # Ambiguous or too-weak match: remain silent (no info logging)
+        # Below threshold: remain silent
         return None, 0.0, best_debug
 
 def main(args=None):
