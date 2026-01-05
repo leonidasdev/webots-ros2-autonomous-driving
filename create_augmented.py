@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 
-"""create_augmented.py - generate pre-scaled color templates in resources/.
+"""Generate canonical and pre-scaled template images in ``resources/``.
 
-This script creates canonical color copies of original templates and
-writes a small set of pre-scaled variants (named with `_scaleNN`) into
-the package `resources/` folder. The detector loads these pre-generated
-templates so no runtime resizing is required.
+This utility produces a set of canonical `_aug_N` copies for each
+original template image found in the package `resources/` directory,
+and writes a small selection of pre-scaled variants for each canonical
+copy. Pre-scaling templates removes the need for runtime resizing in
+the sign detector and keeps detection deterministic and fast.
+
+Behavior summary:
+- For each original image (files without ``_aug_`` in the name), the
+  script writes up to ``max_per_image`` canonical copies named
+  ``<basename>_aug_<N>.<ext>``.
+- For each canonical copy a small collection of scaled templates is
+  written using the suffix ``_scaleNN`` where ``NN`` is the scale as
+  an integer percentage (e.g. ``scale110`` for 1.10).
+- A marker file (``.aug_done``) is created after a successful run to
+  avoid re-generating templates on subsequent launches.
 
 Usage:
-    python create_augmented.py (also invoked by launch/launch.py)
+    python create_augmented.py
+.
+This file is also invoked by ``launch/launch.py`` during startup when
+needed.
 """
 
 import os
@@ -17,39 +31,50 @@ import cv2
 import numpy as np
 from random import choice, seed
 
-def transform_image(img, scale=1.0):
-    """Apply isotropic scaling (about the center).
 
-    For canonical augmented images we write the original-sized image; the
-    explicit scaled templates are written separately by resizing the
-    canonical image to the desired `output_scales`.
+def transform_image(img, scale=1.0):
+    """Return an isotropically scaled copy of ``img`` about its center.
+
+    Notes:
+    - The returned image keeps the original canvas size; use
+      ``cv2.resize`` instead when explicit output dimensions are required.
+    - The function is provided for completeness but this script writes
+      canonical copies and uses ``cv2.resize`` to create the explicit
+      scaled templates (so ``transform_image`` is seldom used here).
     """
     h, w = img.shape[:2]
-    M_scale = cv2.getRotationMatrix2D((w/2, h/2), 0, float(scale))
-    img_s = cv2.warpAffine(img, M_scale, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    M_scale = cv2.getRotationMatrix2D((w / 2, h / 2), 0, float(scale))
+    img_s = cv2.warpAffine(
+        img,
+        M_scale,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
     return img_s
 
 
 def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
     """Generate canonical `_aug_N` copies and corresponding scaled templates.
 
-    Arguments:
-        input_dir (str): Path to the `resources/` folder. If None the
-            script-local `resources/` is used.
+    Args:
+        input_dir (str|None): Path to the `resources/` folder. If None the
+            script-local ``resources/`` directory is used.
         max_per_image (int): Maximum number of canonical `_aug_N` copies
             to create per original image.
-        seed_val (int): Random seed for deterministic behavior.
+        seed_val (int): Random seed for deterministic file-name choices
+            (not heavily used here but kept for determinism).
     """
     seed(seed_val)
     np.random.seed(seed_val)
 
     # Resolve input_dir relative to the script location when not provided
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     if input_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         input_dir = os.path.join(script_dir, 'resources')
 
     # Marker file prevents re-running augmentation on every launch
-    marker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.aug_done')
+    marker_path = os.path.join(script_dir, '.aug_done')
     if os.path.exists(marker_path):
         print('Augmentations already created (marker found). Skipping generation.')
         return
@@ -58,8 +83,9 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
         print(f"ERROR: input directory '{input_dir}' not found")
         return
 
-    files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    originals = [f for f in files if '_aug_' not in f]
+    # Gather candidate image files (case-insensitive extensions)
+    all_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    originals = [f for f in all_files if '_aug_' not in f]
 
     if not originals:
         print(f"No original template images found in {input_dir}/")
@@ -82,13 +108,14 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
             continue
 
         name, ext = os.path.splitext(fname)
-        # Find existing augmented variants for this base filename
-        all_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        existing_aug = [f for f in all_files if f.startswith(f"{name}_aug_") and f.lower().endswith(ext.lower())]
 
+        # Identify existing canonical augmented copies exactly matching
+        # the pattern '<name>_aug_<N><ext>' (case-insensitive). Scaled
+        # templates that include '_scale' are excluded by the regex.
+        pattern = re.compile(rf"^{re.escape(name)}_aug_(\d+){re.escape(ext)}$", re.IGNORECASE)
         existing_indices = set()
-        for ef in existing_aug:
-            m = re.match(rf"^{re.escape(name)}_aug_(\d+){re.escape(ext)}$", ef)
+        for ef in all_files:
+            m = pattern.match(ef)
             if m:
                 try:
                     existing_indices.add(int(m.group(1)))
@@ -101,12 +128,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
         need = max_per_image - len(existing_indices)
 
-        # We don't create additional canonical photometric variants here;
-        # the scaled templates (below) provide the size diversity used at
-        # detection time. We'll create up to `max_per_image` canonical
-        # copies (identical to original) named with distinct indices.
-
-        # Find available indices to name new augmented files
+        # Allocate the lowest available integer indices starting at 0
         free_indices = []
         idx = 0
         while len(free_indices) < need:
@@ -116,12 +138,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
         # Generate required number of variants and assign to free indices
         created_this = 0
-        # Skip indices known to produce problematic variants
-        skip_indices = {13, 18}
         for out_idx in free_indices:
-            if out_idx in skip_indices:
-                print(f"  Skipping problematic augmentation index {out_idx} for {name}")
-                continue
             aug_name = f"{name}_aug_{out_idx}{ext}"
             aug_path = os.path.join(input_dir, aug_name)
             if os.path.exists(aug_path):
@@ -131,7 +148,17 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
             # Save canonical copy (no photometric changes)
             out = img.copy()
             h, w = img.shape[:2]
-            cv2.imwrite(aug_path, out)
+            try:
+                ok = cv2.imwrite(aug_path, out)
+                if not ok:
+                    print(f"  Warning: failed to write {aug_name}")
+                    skipped += 1
+                    continue
+            except Exception as e:
+                print(f"  Warning: exception writing {aug_name}: {e}")
+                skipped += 1
+                continue
+
             created += 1
             created_this += 1
 
@@ -146,16 +173,22 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
                     scale_path = os.path.join(input_dir, scale_name)
                     # Avoid overwriting if already present
                     if not os.path.exists(scale_path):
-                        cv2.imwrite(scale_path, scaled)
-                        created += 1
-                except Exception:
+                        ok2 = cv2.imwrite(scale_path, scaled)
+                        if ok2:
+                            created += 1
+                        else:
+                            print(f"  Warning: failed to write {scale_name}")
+                            skipped += 1
+                except Exception as e:
+                    print(f"  Warning: exception creating scaled template {scale_name}: {e}")
+                    skipped += 1
                     continue
 
         print(f"  {fname}: created {created_this} new variants (existing: {len(existing_indices)})")
 
     print("\nDone.")
     print(f"  created: {created}")
-    print(f"  skipped (already existed): {skipped}")
+    print(f"  skipped (already existed or failed writes): {skipped}")
     print(f"  resources folder: {input_dir}/")
     print("Note: Files use the '_aug_' naming pattern and will be loaded by sign_detector from resources/")
 
@@ -164,8 +197,8 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
         with open(marker_path, 'w') as f:
             f.write('done')
         print(f"Wrote marker: {marker_path}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: could not write marker file: {e}")
 
 
 if __name__ == '__main__':

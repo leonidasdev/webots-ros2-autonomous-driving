@@ -13,14 +13,14 @@ setup(
     data_files=[
         ('share/' + package_name, ['package.xml']),
         
-        # Recursos ORIGINALES
+        # Resources (images, templates, etc.)
         (os.path.join('share', package_name, 'resources'), 
          glob('resources/*.png') + glob('resources/*.jpg') + glob('resources/*.jpeg')),
         
-        # Archivos de lanzamiento
+        # Launch files
         (os.path.join('share', package_name, 'launch'), 
          glob('launch/*.launch.py') + glob('launch/*.py')),
-        # Augmentation script and world files
+        # Augmentation script
         (os.path.join('share', package_name), ['create_augmented.py']),
         (os.path.join('share', package_name, 'world'), glob('world/*')),
     ],
