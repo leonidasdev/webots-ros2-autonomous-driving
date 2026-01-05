@@ -145,7 +145,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
                 skipped += 1
                 continue
 
-            # Save canonical copy (no photometric changes)
+            # Save canonical copy
             out = img.copy()
             h, w = img.shape[:2]
             try:
@@ -186,7 +186,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
         print(f"  {fname}: created {created_this} new variants (existing: {len(existing_indices)})")
 
-    print("\nDone.")
+    print("Done.")
     print(f"  created: {created}")
     print(f"  skipped (already existed or failed writes): {skipped}")
     print(f"  resources folder: {input_dir}/")
