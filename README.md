@@ -16,9 +16,22 @@ simulated vehicle in Webots with the following responsibilities:
 
 
 ## Prerequisites
-- ROS 2 (tested on Foxy/Galactic — adapt commands for your distro).
+- ROS 2 (tested on Jazzy — adapt commands for your distro).
 - Webots (matching the project world file; `webots` must be on PATH).
 - Python 3 with required packages: `rclpy`, `cv2` (OpenCV), `cv_bridge`, `numpy`.
+
+## Python dependency install
+- When OS-packaged versions are not available you can install Python
+	runtime requirements via pip. A minimal `requirements.txt` is included
+	at the package root. To install:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+Note: `cv_bridge` is typically provided by the ROS packaging system and
+should be installed via `rosdep` or your OS package manager rather than
+pip.
 
 ## Quickstart (developer)
 From a ROS 2 workspace root:
@@ -32,7 +45,7 @@ colcon build --packages-select car_pkg
 . install/setup.bash
 
 # launch demo (starts Webots by default)
-ros2 launch car_pkg launch.py start_webots:=true
+ros2 launch car_pkg launch.py
 ```
 
 Notes:
