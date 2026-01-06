@@ -20,7 +20,7 @@ Behavior summary:
 
 Usage:
     python create_augmented.py
-.
+
 This file is also invoked by ``launch/launch.py`` during startup when
 needed.
 """
