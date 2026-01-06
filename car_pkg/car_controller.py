@@ -42,8 +42,8 @@ class CarController(Node):
         
         # Conversion factor from internal speed units (e.g. km/h-like) to
         # the simulator/motor units used by Webots. Tweak to slow the car
-        # in simulation. Example: 80 * 0.3 => 24 (motor units).
-        self.speed_conversion_factor = 0.3
+        # in simulation. Example: 80 * 0.8 => 64 (motor units).
+        self.speed_conversion_factor = 0.8
         
         # Sign processing state
         self.last_sign = None
