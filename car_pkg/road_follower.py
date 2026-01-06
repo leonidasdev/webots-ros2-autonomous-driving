@@ -77,9 +77,9 @@ class RoadFollower(Node):
         # --- PID controller configuration and state (operates on pixels) ---
         # PID tuning (operates on pixel error). Values were chosen to be
         # conservative for the simulator; tune as needed in-sim.
-        self.Kp = 0.005
-        self.Ki = 0.0003
-        self.Kd = 0.0002
+        self.Kp = 0.002
+        self.Ki = 0.000001
+        self.Kd = 0.0004
 
         # Controller state
         self.integral = 0.0
