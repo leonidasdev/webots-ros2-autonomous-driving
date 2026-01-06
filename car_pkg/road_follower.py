@@ -54,6 +54,7 @@ class RoadFollower(Node):
     def __init__(self):
         super().__init__('road_follower')
         self.bridge = CvBridge()
+        
         # Publishers
         self.steering_pub = self.create_publisher(Float32, '/control/steering', 10)
 
@@ -87,7 +88,7 @@ class RoadFollower(Node):
         self.prev_time = time.time()
 
         # Clamp for integral term to limit long-term bias
-        self.integral_max = 100.0
+        self.integral_max = 50.0
         # Maximum absolute steering command (radians or simulator units)
         self.max_steering = 0.25
 

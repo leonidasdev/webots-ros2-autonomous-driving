@@ -27,11 +27,13 @@ class SignDetector(Node):
     def __init__(self):
         super().__init__('sign_detector')
         self.bridge = CvBridge()
-        # --- ROS communication (publishers / subscribers) ---
-        self.image_sub = self.create_subscription(Image, '/car_camera/image', self.image_callback, 10)
+        
+        # Publishers
         self.sign_pub = self.create_publisher(String, '/traffic_sign', 10)
+        
+        # Subscribers
+        self.image_sub = self.create_subscription(Image, '/car_camera/image', self.image_callback, 10)
 
-        # --- Detection configuration ---
         # Per-type acceptance thresholds (TM_CCOEFF_NORMED)
         self.template_thresholds = {
             'stop': 0.55,

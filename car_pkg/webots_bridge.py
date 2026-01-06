@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 
-"""Bridge node between Webots and ROS2.
+"""Webots ↔ ROS2 bridge node.
 
-This node exposes Webots devices to ROS2 topics and applies control
-commands coming from ROS. It publishes camera images and subscribes to
-speed/steering commands issued by the controller.
+This module provides ``WebotsBridge``, a ROS2 node that exposes selected
+Webots devices as ROS topics and applies incoming control commands to the
+simulated actuators. It publishes camera images, a simulation ``/clock``,
+and a simple ``/odom`` twist estimate (optical-flow preferred, wheel-based
+fallback). It also subscribes to `/control/speed` and `/control/steering`.
+
+The implementation is intentionally lightweight: pose integration is not
+performed; the `/odom` messages provide a twist-only estimate sufficient
+for simple speed monitoring and STOP detection in the controller.
 """
 
 import rclpy
@@ -17,6 +23,8 @@ from cv_bridge import CvBridge
 from std_msgs.msg import Float32
 from sensor_msgs.msg import Image
 from rosgraph_msgs.msg import Clock
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Transform, TransformStamped
 
 
 class WebotsBridge(Node):
@@ -28,8 +36,17 @@ class WebotsBridge(Node):
     """
 
     def __init__(self):
-        super().__init__('webots_bridge')
+        """Create the bridge node and configure Webots devices and topics.
 
+        The initializer attempts to connect to the Webots controller, enables
+        cameras, configures motors, and registers ROS publishers/subscribers.
+
+        Raises:
+            SystemExit: If required Webots devices (cameras or motors) cannot
+                be found or configured.
+        """
+
+        super().__init__('webots_bridge')
         self.get_logger().info("Connecting to Webots...")
 
         # Connect to Webots controller
@@ -41,7 +58,7 @@ class WebotsBridge(Node):
             self.get_logger().error(f"Error connecting to Webots: {e}")
             sys.exit(1)
 
-        # Acquire camera devices
+        # Acquire camera devices from Webots
         try:
             self.car_camera = self.robot.getDevice('car_camera')
             self.road_camera = self.robot.getDevice('road_camera')
@@ -72,26 +89,39 @@ class WebotsBridge(Node):
         self.road_camera.enable(self.timestep)
         self.bridge = CvBridge()
 
-        # --- Publishers (expose sensors / measured values) ---
+        # Publibishers
         # Publishers for camera images
         self.car_camera_pub = self.create_publisher(Image, '/car_camera/image', 10)
         self.road_camera_pub = self.create_publisher(Image, '/road_camera/image', 10)
-        # Publisher for measured vehicle speed (average rear-wheel velocity)
-        self.speed_actual_pub = self.create_publisher(Float32, '/vehicle/speed_actual', 10)
         # Publisher for simulation clock so ROS nodes can use sim-time
         try:
             self.clock_pub = self.create_publisher(Clock, '/clock', 10)
         except Exception:
             self.clock_pub = None
 
-        # --- Subscribers (control commands) ---
+        # Subscribers
         self.speed_sub = self.create_subscription(Float32, '/control/speed', self.speed_callback, 10)
         self.steering_sub = self.create_subscription(Float32, '/control/steering', self.steering_callback, 10)
 
-        # --- Runtime state ---
         # Current commanded speed and steering (applied to Webots devices)
         self.current_speed = 0.0
         self.current_steering = 0.0
+
+        # Wheel radius (m) used to convert wheel angular velocity to linear
+        # speed for a simple odometry/twist publisher. Tune `wheel_radius`
+        # to match the vehicle geometry in your Webots world.
+        self.wheel_radius = 0.1
+
+        # Odometry publisher (twist-only estimate published on `/odom`)
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+
+        # Optical flow-based speed estimation settings.
+        # If enabled, optical flow between consecutive `road_camera` frames
+        # is used to estimate forward speed. `flow_scale` maps pixels/sec
+        # to meters/sec and must be tuned for the camera mounting and FOV.
+        self.use_optical_flow = True
+        self.flow_scale = 0.001
+        self.prev_road_gray = None
 
         # Timer to publish sensor data (convert ms -> s)
         self.timer = self.create_timer(self.timestep / 1000.0, self.publish_data)
@@ -99,16 +129,17 @@ class WebotsBridge(Node):
         self.get_logger().info("Webots Bridge ready")
 
     def speed_callback(self, msg):
-        """Handle incoming speed commands and apply them to rear wheels.
+        """Apply a requested forward speed to the rear wheels.
 
         Args:
-            msg (std_msgs.msg.Float32): Commanded speed (simulator motor units).
-
-        The callback clamps the commanded speed to a safe positive range and
-        applies it to the rear-wheel motors using the Webots motor API.
+            msg (std_msgs.msg.Float32): Commanded forward speed in simulator
+                motor units. The value is clamped to [0, 100].
         """
-        # Clamp commanded speed to [0, 100]
-        self.current_speed = max(0.0, min(float(msg.data), 100.0))
+        # Clamp commanded speed to [0, 100].
+        # Clamp commanded speed to [-100, 100] to allow active braking
+        # (negative values apply reverse torque). The controller may send
+        # short negative commands to help stop the vehicle.
+        self.current_speed = max(-100.0, min(float(msg.data), 100.0))
         # Apply velocity to rear wheels
         try:
             self.motors['right_rear_wheel'].setVelocity(self.current_speed)
@@ -118,14 +149,14 @@ class WebotsBridge(Node):
             self.get_logger().error("Failed to set rear-wheel velocity")
 
     def steering_callback(self, msg):
-        """Handle incoming steering commands and apply to steer motors.
+        """Apply a steering setpoint to the steer motors.
 
         Args:
-            msg (std_msgs.msg.Float32): Steering position/angle for steer motors.
-
-        The value is clamped to a safe range before being applied.
+            msg (std_msgs.msg.Float32): Steering position or angle. The
+                value is clamped to [-0.5, 0.5] before being applied to the
+                steering motor positions.
         """
-        # Clamp steering to [-0.5, 0.5]
+        # Clamp steering to [-0.5, 0.5].
         self.current_steering = max(-0.5, min(float(msg.data), 0.5))
         # Apply steering position to both steering motors
         try:
@@ -135,12 +166,18 @@ class WebotsBridge(Node):
             self.get_logger().error("Failed to set steering position")
 
     def publish_data(self):
-        """Advance the simulation one step and publish sensor topics.
+        """Advance the simulation and publish sensor topics.
 
-        This method reads camera images from Webots, converts them to ROS
-        `sensor_msgs/Image` messages and publishes them. It also publishes
-        the simulation clock and an observed rear-wheel velocity when
-        available.
+        This method performs a single simulation step, then publishes the
+        following topics when data is available:
+        - `/car_camera/image` (sensor_msgs/Image)
+        - `/road_camera/image` (sensor_msgs/Image)
+        - `/clock` (rosgraph_msgs/Clock)
+        - `/odom` (nav_msgs/Odometry) — twist-only estimate
+
+        The `/odom` message is produced from dense optical flow computed on
+        the `road_camera` frames when `use_optical_flow` is enabled; a
+        wheel-velocity-based fallback is used otherwise.
         """
         if self.robot.step(self.timestep) == -1:
             return
@@ -164,7 +201,7 @@ class WebotsBridge(Node):
                 road_msg = self.bridge.cv2_to_imgmsg(road_image_rgb, "bgr8")
                 self.road_camera_pub.publish(road_msg)
 
-            # Publish simulation clock so ROS nodes can use sim-time
+            # Publish simulation clock so ROS nodes can use sim-time.
             if self.clock_pub is not None:
                 sim_t = float(self.robot.getTime())
                 sec = int(sim_t)
@@ -174,17 +211,53 @@ class WebotsBridge(Node):
                 clk.clock.nanosec = nsec
                 self.clock_pub.publish(clk)
 
-                # Publish measured rear-wheel velocity so controllers can
-                # observe physical inertia. Use available motor API.
+                # Publish a minimal `/odom` message. Prefer optical-flow-based
+                # speed estimation (computed from `road_camera`) and fall back
+                # to wheel velocities when necessary. The produced Odometry
+                # message contains a zero pose and a populated `twist`.
                 try:
-                    vr = self.motors['right_rear_wheel'].getVelocity()
-                    vl = self.motors['left_rear_wheel'].getVelocity()
-                    avg_v = float((vr + vl) / 2.0)
-                    vmsg = Float32()
-                    vmsg.data = avg_v
-                    self.speed_actual_pub.publish(vmsg)
+                    # Prefer optical-flow-based speed estimation if enabled.
+                    linear_speed = None
+                    if self.use_optical_flow and 'road_image_rgb' in locals():
+                        try:
+                            gray = cv2.cvtColor(road_image_rgb, cv2.COLOR_BGR2GRAY)
+                            if self.prev_road_gray is not None:
+                                # Farneback dense optical flow
+                                flow = cv2.calcOpticalFlowFarneback(
+                                    self.prev_road_gray, gray, None,
+                                    0.5, 3, 15, 3, 5, 1.2, 0)
+                                mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                                mean_mag = float(np.mean(mag))
+                                # convert pixels/frame -> pixels/sec
+                                dt = float(self.timestep) / 1000.0
+                                pixels_per_sec = mean_mag / max(dt, 1e-6)
+                                linear_speed = pixels_per_sec * float(self.flow_scale)
+                            # store for next iteration
+                            self.prev_road_gray = gray
+                        except Exception:
+                            linear_speed = None
+
+                    # Fallback: use wheel velocities (may be commanded value)
+                    if linear_speed is None:
+                        vr = float(self.motors['right_rear_wheel'].getVelocity())
+                        vl = float(self.motors['left_rear_wheel'].getVelocity())
+                        avg_w = (abs(vr) + abs(vl)) / 2.0
+                        linear_speed = avg_w * float(self.wheel_radius)
+
+                    odom = Odometry()
+                    odom.header.stamp.sec = sec
+                    odom.header.stamp.nanosec = nsec
+                    odom.header.frame_id = 'odom'
+                    odom.child_frame_id = 'base_link'
+                    odom.twist.twist.linear.x = float(linear_speed)
+                    odom.twist.twist.linear.y = 0.0
+                    odom.twist.twist.linear.z = 0.0
+                    odom.twist.twist.angular.x = 0.0
+                    odom.twist.twist.angular.y = 0.0
+                    odom.twist.twist.angular.z = 0.0
+                    self.odom_pub.publish(odom)
                 except Exception:
-                    # If motors don't expose velocity, skip publishing
+                    # If wheels/velocity read fails or other error, skip odom.
                     pass
         except Exception as e:
             self.get_logger().error(f"Error publishing sensor data: {e}")
