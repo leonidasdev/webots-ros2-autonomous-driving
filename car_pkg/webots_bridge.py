@@ -2,15 +2,15 @@
 
 """Webots ↔ ROS2 bridge node.
 
-This module provides ``WebotsBridge``, a ROS2 node that exposes selected
-Webots devices as ROS topics and applies incoming control commands to the
-simulated actuators. It publishes camera images, a simulation ``/clock``,
-and a simple ``/odom`` twist estimate (optical-flow preferred, wheel-based
-fallback). It also subscribes to `/control/speed` and `/control/steering`.
+Provides `WebotsBridge`, a ROS2 node that exposes selected Webots devices
+as ROS topics and applies incoming control commands to simulated actuators.
+Published topics include camera images, a simulation `/clock`, and a
+minimal `/odom` twist estimate used for speed monitoring and STOP
+detection. The node subscribes to `/control/speed` and
+`/control/steering` to apply actuator commands.
 
-The implementation is intentionally lightweight: pose integration is not
-performed; the `/odom` messages provide a twist-only estimate sufficient
-for simple speed monitoring and STOP detection in the controller.
+The implementation is lightweight and supplies a twist-only `/odom`
+message rather than a full pose-based odometry estimate.
 """
 
 import rclpy
@@ -24,7 +24,6 @@ from std_msgs.msg import Float32
 from sensor_msgs.msg import Image
 from rosgraph_msgs.msg import Clock
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Transform, TransformStamped
 
 
 class WebotsBridge(Node):
@@ -89,7 +88,7 @@ class WebotsBridge(Node):
         self.road_camera.enable(self.timestep)
         self.bridge = CvBridge()
 
-        # Publibishers
+        # Publishers
         # Publishers for camera images
         self.car_camera_pub = self.create_publisher(Image, '/car_camera/image', 10)
         self.road_camera_pub = self.create_publisher(Image, '/road_camera/image', 10)
@@ -133,13 +132,32 @@ class WebotsBridge(Node):
 
         Args:
             msg (std_msgs.msg.Float32): Commanded forward speed in simulator
-                motor units. The value is clamped to [0, 100].
+                motor units. The value is clamped to [-500, 100]. Negative
+                values request reverse torque for active braking.
         """
-        # Clamp commanded speed to [0, 100].
-        # Clamp commanded speed to [-100, 100] to allow active braking
-        # (negative values apply reverse torque). The controller may send
-        # short negative commands to help stop the vehicle.
-        self.current_speed = max(-100.0, min(float(msg.data), 100.0))
+        # Clamp commanded speed to the supported actuator range. Query the
+        # motors for their `maxVelocity` and ensure we do not request a
+        # speed that exceeds the hardware/robot limits (avoids Webots
+        # warnings like 'requested velocity ... exceeds maxVelocity').
+        req = float(msg.data)
+        try:
+            mr = abs(self.motors['right_rear_wheel'].getMaxVelocity())
+            ml = abs(self.motors['left_rear_wheel'].getMaxVelocity())
+            motor_max = min(mr, ml)
+        except Exception:
+            motor_max = 100.0
+
+        # Positive acceleration cap remains conservative (100); negative
+        # braking can use up to the motor max velocity in magnitude.
+        pos_cap = min(100.0, motor_max)
+        neg_cap = -motor_max
+
+        if req > pos_cap or req < neg_cap:
+            self.get_logger().warning(
+                f"Requested speed {req:.1f} outside motor limits [{neg_cap:.1f},{pos_cap:.1f}] - clamping"
+            )
+
+        self.current_speed = max(neg_cap, min(req, pos_cap))
         # Apply velocity to rear wheels
         try:
             self.motors['right_rear_wheel'].setVelocity(self.current_speed)
