@@ -34,7 +34,7 @@ class SignDetector(Node):
         # --- Detection configuration ---
         # Per-type acceptance thresholds (TM_CCOEFF_NORMED)
         self.template_thresholds = {
-            'stop': 0.60,
+            'stop': 0.50,
             'yield': 0.70,
             'speed_limit': 0.60
         }

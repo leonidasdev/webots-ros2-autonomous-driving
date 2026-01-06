@@ -58,10 +58,6 @@ class CarController(Node):
         # Stop duration: 1 second as per requirements
         self.stop_duration = 1.0
         # Braking / STOP coordination
-        # When a STOP sign is handled we perform stepped braking (commanded)
-        # at twice the normal step rate and start the stop timer once the
-        # commanded speed reaches zero.
-        self.braking = False
         # Physical-stop detection: require measured speed to be below this
         # threshold for `physical_hold_time` seconds before starting the
         # stop-duration timer. If no measured speed is available we fall
@@ -78,12 +74,9 @@ class CarController(Node):
         self.control_dt = 0.01
         self.timer = self.create_timer(self.control_dt, self.control_loop)
 
-        # Speed increment per tick
-        # (1.0 per 0.05s => 20 units/s)
-        self._speed_step_per_sec = 1.0 / 0.05
-        self.speed_step = self._speed_step_per_sec * self.control_dt
-        # Braking step is twice the acceleration step
-        self.braking_step = 2.0 * self.speed_step
+        # Note: we no longer ramp speeds in the controller; the simulator
+        # handles physical acceleration/braking. Commands are applied
+        # immediately.
         
         self.get_logger().info("Car Controller started")
 
@@ -163,15 +156,35 @@ class CarController(Node):
         # Reset yield flag when stopping
         self.yield_active = False
 
-        # Begin stepped braking: mark stopped state and enable braking flag.
+        # Command immediate stop: set commanded speed to zero and mark
+        # stopped state. The simulator will handle deceleration.
         self.is_stopped = True
-        self.braking = True
-        # Reset any previous stop timer; it will be initialized when the
-        # commanded speed reaches zero in the control loop.
+        self.current_speed = 0.0
+        # Reset any previous stop timer; we'll start it after the vehicle
+        # is observed to be physically stopped (or immediately if no
+        # measured speed is available).
         self.stop_start_sim_s = None
+        self.physical_below_start_sim_s = None
+
+        # If we have a measured speed and it's above threshold, wait for
+        # the physical stop confirmation; otherwise start the timer now.
+        if self.measured_speed is None:
+            if self.current_sim_time is not None:
+                self.stop_start_sim_s = float(self.current_sim_time)
+                self.get_logger().info(f"Commanded stop issued at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait (no measured speed)")
+        else:
+            if abs(self.measured_speed) <= self.physical_stop_threshold:
+                if self.current_sim_time is not None:
+                    self.stop_start_sim_s = float(self.current_sim_time)
+                    self.get_logger().info(f"Physical stop observed at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait")
+            else:
+                # Begin waiting-for-physical-stop; `check_stop_timer` will
+                # monitor measured speed and start the 1s timer once held
+                # below threshold.
+                self.waiting_for_physical_stop = True
 
         sim_str = f"sim={self.current_sim_time:.6f}" if self.current_sim_time is not None else "sim=N/A"
-        self.get_logger().info(f"STOP received: beginning braking [{sim_str}]")
+        self.get_logger().info(f"STOP received: commanded immediate stop [{sim_str}]")
 
     def handle_speed_limit(self):
         """Handle `speed_limit_N` signs by parsing and updating `max_speed`.
@@ -290,46 +303,14 @@ class CarController(Node):
         speed_to_publish = 0.0
 
         if self.is_stopped:
-            # If braking is active, step down the commanded speed at twice
-            # the normal acceleration/deceleration rate until we reach 0.
-            if self.braking:
-                # Decrease current speed but never below zero
-                self.current_speed = max(0.0, self.current_speed - self.braking_step)
-                # Publish the commanded braking speed
-                speed_to_publish = self.current_speed * self.speed_conversion_factor
-                # If we've reached commanded zero, stop braking and start the
-                # stop-duration timer (using simulation time if available).
-                if self.current_speed <= 0.0:
-                    self.braking = False
-                    # Decide whether to start the stop timer immediately or
-                    # wait for measured (physical) speed to fall below
-                    # `physical_stop_threshold` for `physical_hold_time`.
-                    if self.current_sim_time is not None:
-                        if self.measured_speed is None:
-                            # No measured-speed feedback: start the timer now
-                            self.stop_start_sim_s = float(self.current_sim_time)
-                            self.get_logger().info(f"Commanded stop reached at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait (no measured speed)")
-                        else:
-                            if abs(self.measured_speed) <= self.physical_stop_threshold:
-                                # Already physically nearly stopped: start timer
-                                self.stop_start_sim_s = float(self.current_sim_time)
-                                self.get_logger().info(f"Physical stop observed at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait")
-                            else:
-                                # Vehicle still moving: begin waiting-for-physical-stop
-                                self.waiting_for_physical_stop = True
-                                self.physical_below_start_sim_s = None
-                                self.get_logger().info(f"Commanded zero reached but vehicle still moving (v={self.measured_speed:.2f}); waiting for physical stop")
-            else:
-                # Not braking: we are in the 1s waiting phase (commanded speed is 0)
-                self.check_stop_timer()
-                speed_to_publish = 0.0
+            # We command zero immediately and rely on `check_stop_timer`
+            # to start the 1s stop-duration once the vehicle is observed
+            # to be stationary (or immediately if no measured speed).
+            self.check_stop_timer()
+            speed_to_publish = 0.0
         else:
-            # Smoothly move current_speed toward max_speed
-            if self.current_speed > self.max_speed:
-                self.current_speed = max(self.max_speed, self.current_speed - self.speed_step)
-            elif self.current_speed < self.max_speed:
-                self.current_speed = min(self.max_speed, self.current_speed + self.speed_step)
-            # Publish converted speed for Webots
+            # Immediately command the configured maximum speed (no ramping).
+            self.current_speed = self.max_speed
             speed_to_publish = self.current_speed * self.speed_conversion_factor
 
         speed_msg = Float32()
