@@ -32,7 +32,7 @@ setup(
     maintainer='Leonardo Chen',
     maintainer_email='leochenjin@gmail.com',
     description='Car package with sign detection',
-    license='Apache-2.0',
+    license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

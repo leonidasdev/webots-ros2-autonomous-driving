@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Car autonomous control package for Webots</description>
   <maintainer email="leochenjin@gmail.com">Leonardo Chen</maintainer>
-  <license>Apache-2.0</license>
+  <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
