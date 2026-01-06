@@ -1,48 +1,58 @@
-# webots-ros2-autonomous-driving (car_pkg)
+# webots-ros2-autonomous-driving
 
-Quick setup and run instructions for Ubuntu (ROS2 + Webots).
+Professional, modular demonstration package for autonomous driving research and prototyping using Webots and ROS 2.
 
-**System prerequisites**
-- ROS 2 (install appropriate distro for your system) and `colcon` build tools.
-- Webots (install per Webots official instructions).
- - Webots (install per Webots official instructions).
+Overview
+--------
+This repository provides a compact, well-structured stack demonstrating lane following and sign-aware longitudinal control in simulation. It is designed for researchers and engineers who need a reproducible demo combining perception, control, and simulator integration.
 
-**Python dependencies**
-Install Python packages into the same Python environment used by your ROS2 installation:
+Key features
+------------
+- Lightweight lane detection (`road_follower`) with a proven PID-based lateral controller.
+- Template-based traffic sign detection (`sign_detector`) with pre-scaled assets for robust matching.
+- Webots/ROS bridge (`webots_bridge`) providing sensors and actuators integration and measured vehicle feedback.
+- Controller node (`car_controller`) implementing sign-triggered behaviors (STOP, speed limits) and safety-oriented stop confirmation.
+- Utility script (`create_augmented.py`) to generate and package scaled sign templates for consistent detection across distances.
 
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
-```
-
-OCR is not used by default; speed limits are recognized by template matching.
-
-**ROS2 package setup**
-From the workspace root (the folder that contains `src`):
+Installation (developer)
+------------------------
+Clone the repository into your ROS 2 workspace, then build and source the install overlay:
 
 ```bash
-# Install ROS package dependencies
+# from workspace root
 rosdep install --from-paths src --ignore-src -r -y
-
-# Build the workspace (only car_pkg if preferred)
 colcon build --packages-select car_pkg
-
-# Source the install overlay
 . install/setup.bash
 ```
 
-**Run the demo**
-Launch the package (this will run the augmentor and nodes; optionally starts Webots):
+Alternatively, for editable installation of Python dependencies from this package:
+
+```bash
+cd src/car_pkg
+python3 -m pip install -e .
+```
+
+Running the demo
+----------------
+Launch the demo suite (optionally starts Webots):
 
 ```bash
 ros2 launch car_pkg launch.py start_webots:=true
 ```
 
-The sign detector recognizes speed-limit signs by template matching and template filenames; OCR is not used.
+This launches perception, control, and the bridge components; the launch file arranges template preprocessing when needed.
 
-**Notes**
-- Do not pip-install ROS core packages like `rclpy`; those are provided by your ROS2 distro.
-- On Ubuntu, ensure you run the pip install commands in the same environment/shell where you source ROS2.
+Project layout
+--------------
+- `car_pkg/` — Python ROS 2 package (nodes and modules).
+- `resources/` — sign templates and image assets.
+- `launch/` — launch descriptions for starting the demo.
+- `scripts/create_augmented.py` — template augmentation utility.
 
-**Files added**
-- `requirements.txt` — Python dependencies for this project.
+License & authors
+-----------------
+Licensed under the MIT license.
+
+Contributing
+------------
+Contributions are welcome. Please open a PR with a clear description of changes and testing steps.
