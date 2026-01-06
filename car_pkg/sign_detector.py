@@ -2,12 +2,19 @@
 
 """Sign detector node using template matching.
 
-This module implements a template-matching based traffic-sign detector
-for Webots + ROS2. It loads templates from the package `resources/`
-folder and scans incoming camera frames using OpenCV's matchTemplate.
+Description:
+    Template-matching based traffic-sign detector for Webots + ROS2. The
+    node loads image templates from the package `resources/` directory
+    (or the workspace fallback), scans incoming camera frames using
+    OpenCV's `matchTemplate`, and publishes detected sign tokens on
+    `/traffic_sign` for downstream controllers.
 
-Publishes string tokens on `/traffic_sign` such as `stop`, `yield` or
-`speed_limit` which the car_controller consumes.
+Publishes:
+    /traffic_sign (std_msgs/String): Detected sign tokens such as
+        'stop', 'yield', 'speed_limit_50'.
+
+Subscribes:
+    /car_camera/image (sensor_msgs/Image): Camera frames to scan for signs.
 """
 
 import rclpy
@@ -22,15 +29,29 @@ from ament_index_python.packages import get_package_share_directory
 
 
 class SignDetector(Node):
-    """ROS2 node that detects traffic signs by template matching."""
+    """ROS2 node that detects traffic signs by template matching.
+
+    Description:
+        Loads sign templates at startup and scans incoming camera images
+        for template matches. Uses per-sign thresholds and cooldowns to
+        avoid repeated detections.
+    """
 
     def __init__(self):
+        """Initialize the `SignDetector` node and load templates.
+
+        Side effects:
+            - Creates publisher `/traffic_sign` and subscriber
+              `/car_camera/image`.
+            - Loads templates via `load_base_templates` and initializes
+              runtime detection state (cooldowns, frame counters).
+        """
         super().__init__('sign_detector')
         self.bridge = CvBridge()
-        
+
         # Publishers
         self.sign_pub = self.create_publisher(String, '/traffic_sign', 10)
-        
+
         # Subscribers
         self.image_sub = self.create_subscription(Image, '/car_camera/image', self.image_callback, 10)
 
@@ -38,7 +59,7 @@ class SignDetector(Node):
         self.template_thresholds = {
             'stop': 0.55,
             'yield': 0.7,
-            'speed_limit': 0.55
+            'speed_limit': 0.52
         }
 
         # Cooldowns in frames (~30 FPS assumed)
@@ -60,9 +81,12 @@ class SignDetector(Node):
         Returns:
             dict: Mapping template_key -> { 'bgr': np.ndarray, 'h': int, 'w': int }
 
-        The method attempts to read templates from the installed package
-        share directory and falls back to the workspace `resources/` copy
-        when the package is not installed.
+        Behaviour:
+            - Attempts to locate the package share directory for `car_pkg`.
+            - Falls back to a workspace `resources/` directory when the
+              package is not installed.
+            - Loads supported image files and stores their BGR arrays and
+              sizes for later template matching.
         """
         templates = {}
         try:
@@ -113,11 +137,12 @@ class SignDetector(Node):
                     'h': h,
                     'w': w
                 }
-                    # Intentionally silent: do not emit info logs here.
+                # Intentionally silent per-template to avoid noisy logs.
                     
         except Exception as e:
             self.get_logger().error(f"Error loading templates: {str(e)}")
-        
+        # Emit a summary log so users know how many templates were loaded.
+        self.get_logger().info(f"Loaded {len(templates)} templates from resources")
         return templates
     
     def determine_sign_type(self, filename):
@@ -153,9 +178,12 @@ class SignDetector(Node):
         Args:
             msg (sensor_msgs.msg.Image): Image message from `/car_camera/image`.
 
-        The callback downsamples large frames for speed, runs the template
-        detection pipeline, enforces a per-sign cooldown, and publishes
-        detected sign tokens on `/traffic_sign`.
+        Behaviour:
+            - Optionally downsamples large frames for speed.
+            - Calls `detect_sign` to find the best template match.
+            - Enforces per-sign cooldowns to avoid repeated publishes.
+            - Publishes new detections on `/traffic_sign` using
+              `std_msgs/String`.
         """
         self.frame_count += 1
         
@@ -206,9 +234,13 @@ class SignDetector(Node):
         Returns:
             tuple: (detection (str|None), confidence (float), debug_dict (dict|None)).
 
-        The method returns a detection string (e.g. 'stop', 'yield',
-        'speed_limit_50') when a template match exceeds the per-type
-        threshold; otherwise returns (None, 0.0, debug_info).
+        Behaviour:
+            - Iterates over preloaded templates and runs `cv2.matchTemplate`.
+            - Tracks the best match and applies per-type thresholds to
+              decide whether to emit a detection.
+
+        Side effects:
+            None (pure detection function that returns candidate info).
         """
         best_detection = None
         best_confidence = 0.0
@@ -287,6 +319,16 @@ class SignDetector(Node):
         return None, 0.0, best_debug
 
 def main(args=None):
+    """Module entry point to run the SignDetector node.
+
+    Args:
+        args (list or None): Optional args forwarded to `rclpy.init`.
+
+    Behaviour:
+        Initializes ROS2, constructs the `SignDetector` node, and spins
+        until shutdown. Ensures cleanup of the node and ROS2 client on exit.
+    """
+
     rclpy.init(args=args)
     node = SignDetector()
     try:

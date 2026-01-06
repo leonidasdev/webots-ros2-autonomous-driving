@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 
-"""Generate canonical and pre-scaled template images in ``resources/``.
+"""Create canonical and pre-scaled template images in `resources/`.
 
-This utility produces a set of canonical `_aug_N` copies for each
-original template image found in the package `resources/` directory,
-and writes a small selection of pre-scaled variants for each canonical
-copy. Pre-scaling templates removes the need for runtime resizing in
-the sign detector and keeps detection deterministic and fast.
+Description:
+    Utility script that generates canonical augmented copies and a small
+    set of pre-scaled template variants for each original template image
+    found in the `resources/` directory. Pre-scaling reduces runtime
+    work for the sign detector and keeps template matching deterministic.
 
-Behavior summary:
-- For each original image (files without ``_aug_`` in the name), the
-  script writes up to ``max_per_image`` canonical copies named
-  ``<basename>_aug_<N>.<ext>``.
-- For each canonical copy a small collection of scaled templates is
-  written using the suffix ``_scaleNN`` where ``NN`` is the scale as
-  an integer percentage (e.g. ``scale110`` for 1.10).
-- A marker file (``.aug_done``) is created after a successful run to
-  avoid re-generating templates on subsequent launches.
+Behaviour summary:
+    - For each original image (files without ``_aug_`` in the name), the
+        script writes up to ``max_per_image`` canonical copies named
+        ``<basename>_aug_<N>.<ext>``.
+    - For each canonical copy a collection of scaled templates is
+        written using the suffix ``_scaleNN`` where ``NN`` is the scale as
+        an integer percentage (e.g. ``scale110`` for 1.10).
+    - A marker file (``.aug_done``) is created after a successful run to
+        avoid re-generating templates on subsequent launches.
 
 Usage:
     python create_augmented.py
 
-This file is also invoked by ``launch/launch.py`` during startup when
-needed.
+Notes:
+    This script is also invoked by ``launch/launch.py`` during startup
+    when template augmentation is required.
 """
 
 import os
@@ -35,12 +36,19 @@ from random import seed
 def transform_image(img, scale=1.0):
     """Return an isotropically scaled copy of ``img`` about its center.
 
+    Args:
+        img (numpy.ndarray): Input image (H x W x C) in BGR or grayscale.
+        scale (float): Isotropic scale factor applied about image center.
+
+    Returns:
+        numpy.ndarray: A warped image with the same canvas size as ``img``
+            containing the scaled content.
+
     Notes:
-    - The returned image keeps the original canvas size; use
-      ``cv2.resize`` instead when explicit output dimensions are required.
-    - The function is provided for completeness but this script writes
-      canonical copies and uses ``cv2.resize`` to create the explicit
-      scaled templates (so ``transform_image`` is seldom used here).
+        - The returned image keeps the original canvas size; use
+            ``cv2.resize`` when explicit output dimensions are required.
+        - This helper is provided for completeness; the script primarily
+            uses ``cv2.resize`` when producing explicit scaled templates.
     """
     h, w = img.shape[:2]
     M_scale = cv2.getRotationMatrix2D((w / 2, h / 2), 0, float(scale))
@@ -58,12 +66,21 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
     """Generate canonical `_aug_N` copies and corresponding scaled templates.
 
     Args:
-        input_dir (str|None): Path to the `resources/` folder. If None the
-            script-local ``resources/`` directory is used.
+        input_dir (str|None): Path to the `resources/` folder. If ``None``
+            the script-local ``resources/`` directory is used.
         max_per_image (int): Maximum number of canonical `_aug_N` copies
             to create per original image.
-        seed_val (int): Random seed for deterministic file-name choices
-            (not heavily used here but kept for determinism).
+        seed_val (int): Random seed for deterministic file-name choices.
+
+    Returns:
+        None
+
+    Behaviour / Side effects:
+        - Writes new files to the `resources/` folder for canonical copies
+          and scaled variants.
+        - Creates a marker file `.aug_done` in the resources folder on
+          successful completion to avoid re-generation in subsequent runs.
+        - Prints summary information to stdout about created/skipped files.
     """
     seed(seed_val)
     np.random.seed(seed_val)

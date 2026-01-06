@@ -2,15 +2,27 @@
 
 """Webots ↔ ROS2 bridge node.
 
-Provides `WebotsBridge`, a ROS2 node that exposes selected Webots devices
-as ROS topics and applies incoming control commands to simulated actuators.
-Published topics include camera images, a simulation `/clock`, and a
-minimal `/odom` twist estimate used for speed monitoring and STOP
-detection. The node subscribes to `/control/speed` and
-`/control/steering` to apply actuator commands.
+Description:
+    Lightweight bridge that exposes selected Webots sensors and actuators
+    as ROS2 topics and applies incoming control commands to the simulated
+    vehicle. The bridge publishes camera images, a simulation `/clock`,
+    and a minimal `/odom` twist estimate used by controller logic for
+    speed monitoring and STOP detection.
 
-The implementation is lightweight and supplies a twist-only `/odom`
-message rather than a full pose-based odometry estimate.
+Publishes:
+    /car_camera/image (sensor_msgs/Image): Front-facing camera frames.
+    /road_camera/image (sensor_msgs/Image): Road-facing camera frames.
+    /clock (rosgraph_msgs/Clock): Simulation clock for nodes using sim-time.
+    /odom (nav_msgs/Odometry): Twist-only speed estimate (optical-flow or wheel fallback).
+
+Subscribes:
+    /control/speed (std_msgs/Float32): Commanded forward/reverse speed.
+    /control/steering (std_msgs/Float32): Steering setpoint applied to steering motors.
+
+Notes:
+    This module intentionally publishes a twist-only `/odom` message and
+    does not provide a full pose estimate. Optical flow is used when
+    enabled for speed estimation; otherwise wheel velocities are used.
 """
 
 import rclpy
@@ -29,20 +41,32 @@ from nav_msgs.msg import Odometry
 class WebotsBridge(Node):
     """Expose Webots sensors/actuators as ROS2 topics.
 
-    - Publishes `/car_camera/image` and `/road_camera/image` (sensor_msgs/Image)
-    - Subscribes to `/control/speed` and `/control/steering` (Float32)
-    - Applies speed to rear-wheel motors and steering positions to steer motors
+    Description:
+        Node that maps Webots devices (cameras, motors) to ROS2 topics
+        and applies incoming control commands to the robot actuators.
+
+    Publishes:
+        See module-level `Publishes` section.
+
+    Subscribes:
+        See module-level `Subscribes` section.
     """
 
     def __init__(self):
         """Create the bridge node and configure Webots devices and topics.
 
-        The initializer attempts to connect to the Webots controller, enables
-        cameras, configures motors, and registers ROS publishers/subscribers.
+        Description:
+            Connects to the Webots controller, configures cameras and
+            motors, enables sensors, and creates ROS2 publishers and
+            subscribers used by the rest of the system.
 
         Raises:
-            SystemExit: If required Webots devices (cameras or motors) cannot
-                be found or configured.
+            SystemExit: If required Webots devices (cameras or motors)
+                cannot be found or configured.
+
+        Side effects:
+            Sets up `self.robot`, `self.motors`, camera handles,
+            publishers/subscribers, and the periodic timer `self.timer`.
         """
 
         super().__init__('webots_bridge')
@@ -132,8 +156,17 @@ class WebotsBridge(Node):
 
         Args:
             msg (std_msgs.msg.Float32): Commanded forward speed in simulator
-                motor units. The value is clamped to [-500, 100]. Negative
-                values request reverse torque for active braking.
+                motor units. Negative values request reverse torque for
+                active braking.
+
+        Behaviour:
+            - Clamps the requested speed to the supported actuator range
+              (positive cap conservative, negative cap allowed up to motor max).
+            - Updates `self.current_speed` and calls `setVelocity` on rear
+              wheel motors.
+
+        Side effects:
+            Mutates `self.current_speed` and commands the Webots motors.
         """
         # Clamp commanded speed to the supported actuator range. Query the
         # motors for their `maxVelocity` and ensure we do not request a
@@ -171,8 +204,11 @@ class WebotsBridge(Node):
 
         Args:
             msg (std_msgs.msg.Float32): Steering position or angle. The
-                value is clamped to [-0.5, 0.5] before being applied to the
-                steering motor positions.
+                value is clamped to [-0.5, 0.5] before being applied.
+
+        Side effects:
+            Mutates `self.current_steering` and calls `setPosition` on both
+            steering motors.
         """
         # Clamp steering to [-0.5, 0.5].
         self.current_steering = max(-0.5, min(float(msg.data), 0.5))
@@ -186,16 +222,27 @@ class WebotsBridge(Node):
     def publish_data(self):
         """Advance the simulation and publish sensor topics.
 
-        This method performs a single simulation step, then publishes the
-        following topics when data is available:
-        - `/car_camera/image` (sensor_msgs/Image)
-        - `/road_camera/image` (sensor_msgs/Image)
-        - `/clock` (rosgraph_msgs/Clock)
-        - `/odom` (nav_msgs/Odometry) — twist-only estimate
+        Description:
+            Called periodically by `self.timer` to step Webots and publish
+            available sensor data to ROS topics.
 
-        The `/odom` message is produced from dense optical flow computed on
-        the `road_camera` frames when `use_optical_flow` is enabled; a
-        wheel-velocity-based fallback is used otherwise.
+        Publishes:
+            - `/car_camera/image` (sensor_msgs/Image)
+            - `/road_camera/image` (sensor_msgs/Image)
+            - `/clock` (rosgraph_msgs/Clock)
+            - `/odom` (nav_msgs/Odometry): twist-only estimate
+
+        Behaviour:
+            - Steps the Webots simulation with `self.robot.step(self.timestep)`.
+            - Converts camera frames to ROS images and publishes them.
+            - Publishes the simulation clock for sim-time consumers.
+            - Computes a forward speed estimate using optical flow when
+              enabled, otherwise falls back to wheel velocities, and
+              publishes a minimal `Odometry` message with only twist.
+
+        Side effects:
+            Reads camera and motor device state and publishes multiple ROS
+            topics. May update `self.prev_road_gray` for optical flow.
         """
         if self.robot.step(self.timestep) == -1:
             return
@@ -282,6 +329,17 @@ class WebotsBridge(Node):
 
 
 def main(args=None):
+    """Entry point used when launching this module as a script.
+
+    Args:
+        args (list or None): Optional argument list forwarded to `rclpy.init`.
+
+    Behaviour:
+        Initializes the ROS2 client library, creates the `WebotsBridge`
+        node, and spins until shutdown (Ctrl-C). Ensures proper cleanup
+        by destroying the node and calling `rclpy.shutdown()`.
+    """
+
     rclpy.init(args=args)
     node = WebotsBridge()
     try:

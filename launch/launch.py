@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 
-"""ROS2 launch file for the autonomous driving demo.
+"""ROS2 launch description for the autonomous driving demo.
 
-This launch description performs three responsibilities:
-1. Run the local `create_augmented.py` once to ensure pre-scaled templates
-   exist in `resources/`.
-2. Optionally start the Webots simulator with the provided world file.
-3. Launch the ROS nodes that implement the robot (bridge, perception,
-   control and lane-following).
+Description:
+    This module provides a `generate_launch_description` function that
+    composes a simple launch description to prepare templates, optionally
+    start the Webots simulator, and launch the core ROS nodes that form
+    the demonstration stack (bridge, perception, controller, road follower).
 
-The launch is intentionally simple — node parameters and more advanced
-composition are left to individual development tasks.
+Behaviour:
+    - Executes `scripts/create_augmented.py` once at launch to produce
+        pre-scaled sign templates in `resources/` when needed.
+    - Optionally starts the Webots simulator using the `start_webots`
+        launch argument (defaults to true).
+    - Launches the package's console-entrypoint nodes: `webots_bridge`,
+        `road_follower`, `sign_detector`, and `car_controller`.
+
+Notes:
+    This launch file is intentionally minimal; node-level parameters and
+    advanced lifecycle handling are expected to be managed by individual
+    node configurations or a more feature-rich launch description.
 """
 
 from launch import LaunchDescription
@@ -24,12 +33,19 @@ import sys
 
 
 def generate_launch_description():
-    """Create and return the launch description.
+    """Create and return the ROS2 `LaunchDescription` for the demo.
 
-    The augmentation script is executed via `ExecuteProcess` so that the
-    same Python interpreter used to launch ROS will run it (avoids PATH
-    differences). Webots is started conditionally based on the
-    `start_webots` launch argument.
+    Returns:
+        launch.LaunchDescription: A launch description that executes the
+                augmentation helper, optionally starts Webots, and launches
+                the core ROS nodes for the demo.
+
+    Behaviour:
+        - Runs `create_augmented.py` via `ExecuteProcess` using the same
+            Python interpreter as the launcher to avoid environment issues.
+        - Declares a `start_webots` launch argument that controls whether
+            the Webots simulator process is started.
+        - Adds Node actions for the package's main executables.
     """
 
     # Path to the augmentation helper inside the package (now under scripts/)
