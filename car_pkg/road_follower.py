@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
 
-"""Road follower node: detect lane/road center and publish steering.
+"""Road follower node.
 
-Subscriptions:
-- `/road_camera/image` (sensor_msgs/Image): camera frames used for
-    lane/road-center detection.
+Description:
+    Node that detects the lateral road center from `/road_camera/image`
+    frames and publishes steering commands to keep the vehicle centered
+    in the lane. Detection uses a column-intensity analysis and a small
+    PID controller operating on pixel error. The controller includes
+    protections against integral windup and simple recovery strategies
+    for short detection outages.
 
-Publications:
-- `/control/steering` (std_msgs/Float32): steering command published
-    as a single float (simulator/motor steering units).
+Publishes:
+    /control/steering (std_msgs/Float32): Steering setpoint for the vehicle.
 
-Summary:
-This node finds a lateral road center using a lightweight
-column-intensity approach, converts pixel error to a steering command
-via a simple PID controller, and publishes the command. The node is
-designed to be robust in simulation: it avoids integral windup when
-detections are unreliable and falls back to recent confident
-detections for short outages.
-
-Design goals:
-- Keep the detector simple and robust for a simulation environment.
-- Avoid control windup when visual detections are unreliable.
-- Fall back to recent confident detections for short outages.
-
-The PID controller operates on pixel error (pixels between detected
-center and image center). When `confidence` is False the controller
-resets or ignores integral/derivative contributions to prevent
-unwanted steering from noisy measurements.
+Subscribes:
+    /road_camera/image (sensor_msgs/Image): Camera frames used for lane detection.
 """
 
 import rclpy
@@ -52,6 +40,14 @@ class RoadFollower(Node):
     """
 
     def __init__(self):
+        """Initialize the `RoadFollower` node and controller state.
+
+        Side effects:
+            - Creates ROS2 publisher `/control/steering` and subscriber
+                `/road_camera/image`.
+            - Initializes PID gains, internal integrators, and persistence
+                counters used for detection smoothing and recovery.
+        """
         super().__init__('road_follower')
         self.bridge = CvBridge()
         
@@ -61,9 +57,9 @@ class RoadFollower(Node):
         # Subscribers
         self.image_sub = self.create_subscription(Image, '/road_camera/image', self.image_callback, 10)
 
-        # --- Detection / image parameters and persistence state ---
-        # Image center (pixels). Many simulator frames are 512 px wide; store
-        # a default here for cases where image metadata isn't available.
+        # Image center (pixels). Many simulator frames are 512 px wide.
+        # This value is updated per-frame in `image_callback` when image
+        # metadata is available so the controller operates on correct size.
         self.image_center = 256
 
         # Last observed centers and persistence counters used to smooth
@@ -75,12 +71,11 @@ class RoadFollower(Node):
         # before attempting fresh recovery. At ~30 FPS, 15 frames ≈ 0.5 s.
         self.no_line_persist_max = 15
 
-        # --- PID controller configuration and state (operates on pixels) ---
         # PID tuning (operates on pixel error). Values were chosen to be
         # conservative for the simulator; tune as needed in-sim.
-        self.Kp = 0.002
+        self.Kp = 0.005
         self.Ki = 0.000001
-        self.Kd = 0.0004
+        self.Kd = 0.0002
 
         # Controller state
         self.integral = 0.0
@@ -102,13 +97,29 @@ class RoadFollower(Node):
         Args:
             msg (sensor_msgs.msg.Image): ROS image message from the road camera.
 
-        The callback converts the ROS image to an OpenCV image, runs the
-        detection pipeline to obtain a road center and a confidence flag,
-        computes a steering command with the PID controller, and publishes
-        the command as a `std_msgs/Float32` message.
+        Behaviour:
+            - Converts the incoming ROS image to OpenCV format.
+            - Updates `self.image_center` to match the current frame width.
+            - Runs `follow_road` to obtain a candidate road center and
+              a confidence flag.
+            - Computes a steering command via `calculate_pid` and publishes
+              it on `/control/steering`.
+
+        Side effects:
+            Updates controller internal state (`last_known_road_center`
+            and PID integrators) and publishes steering messages.
         """
         try:
+
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+            # Update image center for the current frame so PID uses correct
+            # pixel coordinates (handles variable-width frames).
+            try:
+                self.image_center = cv_image.shape[1] // 2
+            except Exception:
+                # Keep previous value if image metadata unavailable
+                pass
 
             road_center, confidence = self.follow_road(cv_image)
 
@@ -133,10 +144,16 @@ class RoadFollower(Node):
         Returns:
             tuple: (road_center_x (int), confidence (bool)).
 
-        The method first classifies the scene (LINE / NO_LINE / CROSSWALK)
-        and then uses detection or recovery strategies. When `confidence`
-        is False the returned center is advisory and the controller will
-        reduce corrective action.
+        Behaviour:
+            - Classifies the scene using `_classify_scene`.
+            - For `NO_LINE` or `CROSSWALK`, attempts to reuse a recent
+              confident center for a short persistence window, otherwise
+              performs a relaxed detection (`_handle_line(no_yellow=True)`).
+            - For `LINE`, uses the normal detection pipeline.
+
+        Side effects:
+            May update `self.last_confident_center` and persistence counters
+            when confident detections are found.
         """
         image_center = image.shape[1] // 2
         try:
@@ -186,9 +203,9 @@ class RoadFollower(Node):
             tuple: (scene_str (str), yellow_ratio (float)).
 
         Scene labels:
-        - 'CROSSWALK' when a large fraction of the image contains yellow.
-        - 'NO_LINE' when there is very little yellow present.
-        - 'LINE' otherwise.
+            - 'CROSSWALK' when a large fraction of the image contains yellow.
+            - 'NO_LINE' when there is very little yellow present.
+            - 'LINE' otherwise.
         """
         try:
             h, w = image.shape[:2]
@@ -211,16 +228,20 @@ class RoadFollower(Node):
         Args:
             image (numpy.ndarray): BGR image array from the camera.
             no_yellow (bool): If True, be conservative about accepting
-                              very strong bright peaks (used during
-                              relaxed recovery passes).
+                very strong bright peaks (used during relaxed recovery).
 
         Returns:
             tuple: (x (int), confidence (bool)).
 
-        The detector computes a 1D brightness profile across image columns,
-        smooths it, and selects the dominant peak as a candidate lane
-        center. If the peak is weak the method performs a localized
-        search near the last known center to recover from partial occlusions.
+        Behaviour:
+            - Computes a column-wise brightness profile and smooths it.
+            - Selects the dominant peak as a candidate lane center when
+              it meets conservative confidence thresholds.
+            - If the peak is weak, searches locally near
+              `self.last_known_road_center` for a plausible center.
+
+        Side effects:
+            None beyond returning a candidate center and confidence flag.
         """
         try:
             # Prepare a stable brightness signal
@@ -287,8 +308,11 @@ class RoadFollower(Node):
                 integral/derivative state to avoid windup.
 
         Returns:
-            float: Steering command clamped to
-                [-self.max_steering, self.max_steering].
+            float: Steering command clamped to [-self.max_steering, self.max_steering].
+
+        Side effects:
+            Updates PID internal state: `self.integral`, `self.prev_error`,
+            `self.prev_time`, and `self.prev_confidence`.
         """
 
         # If the vehicle is centered and the detection is unconfident,
@@ -345,6 +369,16 @@ class RoadFollower(Node):
         return steering
 
 def main(args=None):
+    """Module entry point to start the `RoadFollower` node.
+
+    Args:
+        args (list or None): Optional arguments forwarded to `rclpy.init`.
+
+    Behaviour:
+        Initializes the ROS2 client library, creates the `RoadFollower`
+        node, and spins until shutdown. Ensures proper cleanup on exit.
+    """
+
     rclpy.init(args=args)
     node = RoadFollower()
     try:

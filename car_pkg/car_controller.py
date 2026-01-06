@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 
-"""Car controller node: apply speed commands based on detected signs.
+"""Car controller node.
 
-This node subscribes to `/traffic_sign` (std_msgs/String) and publishes
-speed commands to `/control/speed` (std_msgs/Float32).
+Description:
+    Node that manages vehicle speed according to detected traffic signs
+    and simulated time. It applies braking when a STOP sign is seen,
+    enforces speed limits, and supports a YIELD behaviour.
 
-Behavior rules:
-- `base_speed` is the nominal default and initializes `max_speed`.
-- `yield` halves the effective maximum speed.
-- `speed_limit_N` sets the nominal `max_speed` to N.
-- `stop` halts motion for 1 second (using simulation time from /clock),
-  then resumes toward the effective maximum.
+Publishes:
+    /control/speed (std_msgs/Float32): Commanded wheel speed (motor units).
 
-The node uses simulation time from /clock for accurate STOP timing.
+Subscribes:
+    /traffic_sign (std_msgs/String): Tokens produced by the sign detector
+        (e.g. 'stop', 'yield', 'speed_limit_50').
+    /clock (rosgraph_msgs/Clock): Simulation clock used for timing STOPs.
+    /odom (nav_msgs/Odometry): Twist-only odometry (used to detect
+        physical stop via optical-flow or wheel-based estimates).
 """
 
 import rclpy
@@ -23,6 +26,24 @@ from nav_msgs.msg import Odometry
 
 
 class CarController(Node):
+    """ROS2 node that converts traffic-sign input into speed commands.
+
+    Description:
+        The controller listens for high-level sign tokens and publishes
+        immediate speed commands to `/control/speed`. STOP handling uses
+        odometry to detect a physical halt before initiating the configured
+        stop-duration timer.
+
+    Publishes:
+        /control/speed (std_msgs/Float32): Commanded forward/reverse
+            speed sent to the bridge which applies it to wheel motors.
+
+    Subscribes:
+        /traffic_sign (std_msgs/String): Incoming sign tokens.
+        /clock (rosgraph_msgs/Clock): Simulation time for precise timing.
+        /odom (nav_msgs/Odometry): Measured linear speed used to
+            determine physical stop.
+    """
     def __init__(self):
         super().__init__('car_controller')
         
@@ -43,8 +64,8 @@ class CarController(Node):
         
         # Conversion factor from internal speed units (e.g. km/h-like) to
         # the simulator/motor units used by Webots. Tweak to slow the car
-        # in simulation. Example: 80 * 0.8 => 64 (motor units).
-        self.speed_conversion_factor = 0.8
+        # in simulation. Example: 80 * 0.5 => 40 (motor units).
+        self.speed_conversion_factor = 0.5
         
         # Sign processing state
         self.last_sign = None
@@ -61,10 +82,9 @@ class CarController(Node):
         # Active braking settings: apply a short negative command (torque)
         # when a STOP is issued to help the vehicle slow down faster.
         self.brake_active = False
-        self.brake_duration = 0.2
         self.brake_end_sim_s = None
-        # Brake strength in controller internal units. Tune as needed.
-        self.brake_strength = 40.0
+        # Braking strength (internal units per second), maximum is approximately 174 after conversion
+        self.brake_strength = 174/self.speed_conversion_factor
         # Braking / STOP coordination
         # Physical-stop detection: require measured speed to be below this
         # threshold for `physical_hold_time` seconds before starting the
@@ -94,8 +114,9 @@ class CarController(Node):
         Args:
             msg (rosgraph_msgs.msg.Clock): Simulation clock message.
 
-        Stores the latest simulation time in `self.current_sim_time` as
-        a floating-point seconds value for STOP timing.
+        Side effects:
+            Updates `self.current_sim_time` (float seconds) used by stop
+            timing logic.
         """
         t = msg.clock
         self.current_sim_time = float(t.sec) + float(t.nanosec) * 1e-9
@@ -104,11 +125,13 @@ class CarController(Node):
         """Process traffic-sign messages and dispatch handlers.
 
         Args:
-            msg (std_msgs.msg.String): Incoming sign token from `/traffic_sign`.
+            msg (std_msgs.msg.String): Incoming sign token from
+                `/traffic_sign` (string payload).
 
-        The method enforces a cooldown between duplicate sign events (based
-        on simulation time) and calls the appropriate handler when a new
-        sign is accepted.
+        Behaviour:
+            Enforces a cooldown window to avoid rapid duplicate processing
+            and dispatches to `handle_traffic_sign` when a new sign is
+            accepted.
         """
         # Skip processing if we don't have sim time yet
         if self.current_sim_time is None:
@@ -130,9 +153,12 @@ class CarController(Node):
             self.handle_traffic_sign()
             
     def handle_traffic_sign(self):
-        """Dispatch to a specific handler based on the last received sign.
+        """Dispatch to the appropriate handler for the last received sign.
 
-        No arguments. Uses `self.last_sign` to choose the handler.
+        Uses `self.last_sign` to select the handler, for example:
+        - 'yield' -> `handle_yield`
+        - 'stop' -> `handle_stop`
+        - 'speed_limit_*' -> `handle_speed_limit`
         """
         if self.last_sign == 'yield':
             self.handle_yield()
@@ -144,21 +170,32 @@ class CarController(Node):
     def handle_yield(self):
         """Handle a YIELD sign by halving the configured `max_speed`.
 
-        Note: this implementation mutates `self.max_speed` immediately.
+        Side effects:
+            Mutates `self.max_speed` to half its current value and sets
+            `self.yield_active`.
         """
         if not self.yield_active:
-            self.max_speed = self.max_speed // 2
+            self.max_speed = self.max_speed / 2.0
             self.get_logger().info(f"YIELD received: max speed halved from {self.max_speed * 2} to {self.max_speed}")
             self.yield_active = True
         else:
             self.get_logger().info("YIELD received but already active: no change applied")
             
     def handle_stop(self):
-        """Handle a STOP sign: begin commanded braking and prepare to time stop.
+        """Handle a STOP sign: initiate braking and prepare the stop timer.
 
-        The controller will step the commanded speed down (see
-        `self.braking_step`) until it reaches zero; once commanded zero is
-        reached the 1s stop timer will be started (using sim time).
+        Behaviour:
+                - Commands an immediate stop (sets `self.is_stopped` and
+                    `self.current_speed = 0.0`).
+                - Initiates active braking (short negative commands) while
+                    waiting for `self.measured_speed` to fall below
+                    `self.physical_stop_threshold` for `self.physical_hold_time`.
+                - If odometry is unavailable, may apply a short timed brake
+                    as a fallback.
+
+        Side effects:
+                Sets `self.is_stopped`, `self.brake_active`, and related
+                timing state used by `check_stop_timer`.
         """
 
         # Reset yield flag when stopping
@@ -177,14 +214,16 @@ class CarController(Node):
         # If we have a measured speed and it's above threshold, wait for
         # the physical stop confirmation; otherwise start the timer now.
         if self.measured_speed is None:
+            # If no measured speed is available we still apply an active
+            # brake continuously until a physical-stop measurement is
+            # observed. Do NOT use a short timed brake here; rely on the
+            # optical-flow / wheel-velocity measurement to detect the
+            # physical stop and start the stop-duration timer.
+            self.waiting_for_physical_stop = True
+            self.brake_active = True
+            self.brake_end_sim_s = None
             if self.current_sim_time is not None:
-                self.stop_start_sim_s = float(self.current_sim_time)
-                self.get_logger().info(f"Commanded stop issued at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait (no measured speed)")
-            # Apply a short active brake immediately (if we have sim time)
-            if self.current_sim_time is not None:
-                self.brake_active = True
-                self.brake_end_sim_s = float(self.current_sim_time) + float(self.brake_duration)
-                self.get_logger().info(f"Active brake applied until sim {self.brake_end_sim_s:.6f}s")
+                self.get_logger().info(f"Active braking started at sim {self.current_sim_time:.6f}s; waiting for physical stop (no measured speed yet)")
         else:
             if abs(self.measured_speed) <= self.physical_stop_threshold:
                 if self.current_sim_time is not None:
@@ -194,12 +233,15 @@ class CarController(Node):
                 # Begin waiting-for-physical-stop; `check_stop_timer` will
                 # monitor measured speed and start the 1s timer once held
                 # below threshold.
+                # Actively brake until measured speed is observed below the
+                # physical threshold for `physical_hold_time` seconds.
                 self.waiting_for_physical_stop = True
-                # Apply a short active brake while waiting for physical stop
+                self.brake_active = True
+                # Clear timed end so braking continues until measurement shows
+                # the vehicle is physically stopped.
+                self.brake_end_sim_s = None
                 if self.current_sim_time is not None:
-                    self.brake_active = True
-                    self.brake_end_sim_s = float(self.current_sim_time) + float(self.brake_duration)
-                    self.get_logger().info(f"Active brake applied until sim {self.brake_end_sim_s:.6f}s (waiting for physical stop)")
+                    self.get_logger().info(f"Active braking started at sim {self.current_sim_time:.6f}s; waiting for physical stop")
 
         sim_str = f"sim={self.current_sim_time:.6f}" if self.current_sim_time is not None else "sim=N/A"
         self.get_logger().info(f"STOP received: commanded immediate stop [{sim_str}]")
@@ -207,8 +249,11 @@ class CarController(Node):
     def handle_speed_limit(self):
         """Handle `speed_limit_N` signs by parsing and updating `max_speed`.
 
-        Expects `self.last_sign` to be of the form 'speed_limit_<N>'. If the
-        numeric parsing fails the method logs and leaves existing limits.
+        Expects `self.last_sign` to be of the form ``speed_limit_<N>``.
+
+        Side effects:
+            Updates `self.max_speed` (clamped to [10, 100]) and adjusts
+            `self.current_speed` if not stopped.
         """
         
         # Reset yield flag when a new speed limit is received
@@ -246,8 +291,14 @@ class CarController(Node):
     def odom_callback(self, msg):
         """Receive odometry and compute planar speed magnitude.
 
-        Computes speed = sqrt(vx**2 + vy**2) using the `twist.twist.linear`
-        components and stores it in `self.measured_speed`.
+        Args:
+            msg (nav_msgs.msg.Odometry): Incoming odometry message. The
+                callback extracts `twist.twist.linear.x` and `.y` and
+                computes the scalar planar speed.
+
+        Side effects:
+            Updates `self.measured_speed` (float meters/sec) or sets it to
+            `None` on error.
         """
         try:
             vx = float(msg.twist.twist.linear.x)
@@ -257,19 +308,30 @@ class CarController(Node):
             self.measured_speed = None
             
     def check_stop_timer(self):
-        """Check if the 1s STOP duration has elapsed (using sim time).
+        """Monitor stop/brake timers and transition out of STOP when ready.
 
-        When the stop timer has been started (see `self.stop_start_sim_s`)
-        this method will resume motion after `self.stop_duration` seconds
-        of simulation time have elapsed.
+        Behaviour:
+                - Expires timed active brake windows and starts the stop
+                    duration timer if appropriate.
+                - When waiting for a physical stop, requires measured speed
+                    to remain below `self.physical_stop_threshold` for
+                    `self.physical_hold_time` before starting the stop timer.
+                - When the configured `stop_duration` has elapsed, calls
+                    `resume_after_stop` to resume motion.
         """
         if not self.is_stopped:
             return
-        # Clear active brake if its duration expired
-        if self.brake_active and self.current_sim_time is not None and self.brake_end_sim_s is not None:
-            if self.current_sim_time >= self.brake_end_sim_s:
+        # Handle timed brake expiry: if a timed brake was set (fallback for
+        # missing odometry) expire it and start the stop-duration timer.
+        if self.brake_active and self.brake_end_sim_s is not None:
+            if self.current_sim_time is None:
+                return
+            if float(self.current_sim_time) >= float(self.brake_end_sim_s):
                 self.brake_active = False
                 self.brake_end_sim_s = None
+                # Start stop-duration timer now that timed brake completed
+                self.stop_start_sim_s = float(self.current_sim_time)
+                self.get_logger().info(f"Timed brake expired at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait")
         # If we're waiting for the vehicle to physically slow down, check
         # measured speed first and require it to be below threshold for a
         # short hold time before starting the stop-duration timer.
@@ -288,6 +350,8 @@ class CarController(Node):
                 if float(self.current_sim_time) - self.physical_below_start_sim_s >= self.physical_hold_time:
                     self.stop_start_sim_s = float(self.current_sim_time)
                     self.waiting_for_physical_stop = False
+                    # Stop active braking now that physical stop confirmed
+                    self.brake_active = False
                     self.physical_below_start_sim_s = None
                     self.get_logger().info(f"Physical stop observed at sim {self.stop_start_sim_s:.6f}s; starting {self.stop_duration}s wait")
                     # Fall through to check the stop timer below
@@ -307,13 +371,14 @@ class CarController(Node):
             self.resume_after_stop()
         
     def resume_after_stop(self):
-        """Resume motion after a completed STOP period.
+        """Resume motion after the STOP waiting period.
 
-        Sets `self.is_stopped` to False and updates `self.current_speed`
-        toward the configured `max_speed`.
+        Side effects:
+            Clears STOP state and sets `self.current_speed = self.max_speed`.
         """
         self.is_stopped = False
         self.current_speed = self.max_speed
+            
         # Ensure brake state cleared on resume
         self.brake_active = False
         self.brake_end_sim_s = None
@@ -321,11 +386,16 @@ class CarController(Node):
         self.get_logger().info(f"Resuming: speed set to {self.current_speed:.1f} (max={self.max_speed}) [{sim_str}]")
         
     def control_loop(self):
-        """Main control loop: maintain commanded speed and publish to `/control/speed`.
+        """Main periodic control loop: choose and publish speed commands.
 
-        The loop enforces stepped braking when a STOP sign is active, starts
-        the stop-duration timer when commanded speed reaches zero, and
-        otherwise ramps `self.current_speed` toward `self.max_speed`.
+        Behaviour:
+            - If in STOP state, publish negative braking commands while
+              `brake_active` is True, otherwise publish zero until the
+              stop timer completes.
+            - If not stopped, immediately command `self.max_speed`.
+
+        Publishes:
+            std_msgs/Float32 on `/control/speed` each control tick.
         """
         # Decide current commanded speed depending on state
         speed_to_publish = 0.0
@@ -336,7 +406,11 @@ class CarController(Node):
             # to be stationary (or immediately if no measured speed).
             # If an active brake window is in effect, publish a negative
             # speed to apply braking torque for that short duration.
-            if self.brake_active and self.current_sim_time is not None and self.brake_end_sim_s is not None and self.current_sim_time < self.brake_end_sim_s:
+            # Publish braking command continuously while `brake_active` is
+            # True. The brake is cleared once a physical stop is observed
+            # (see `check_stop_timer`) which will then start the 1s stop
+            # timer and resume motion afterward.
+            if self.brake_active:
                 self.check_stop_timer()
                 speed_to_publish = -abs(self.brake_strength) * self.speed_conversion_factor
             else:
