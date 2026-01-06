@@ -1,0 +1,5 @@
+# Python runtime requirements for development / pip installs
+# Note: system/ROS packages (for example `cv_bridge`) may be provided
+# by your OS package manager or ROS install; install those via apt/rosdep.
+opencv-python
+numpy
