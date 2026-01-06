@@ -37,8 +37,8 @@ class SignDetector(Node):
         # Per-type acceptance thresholds (TM_CCOEFF_NORMED)
         self.template_thresholds = {
             'stop': 0.55,
-            'yield': 0.70,
-            'speed_limit': 0.60
+            'yield': 0.7,
+            'speed_limit': 0.55
         }
 
         # Cooldowns in frames (~30 FPS assumed)
@@ -174,8 +174,8 @@ class SignDetector(Node):
                 scale = 1.0
                 small_img = cv_image
 
-            detected_sign, confidence, _ = self.detect_sign(small_img, original_image=cv_image, scale=scale)
-            
+            detected_sign, confidence, debug = self.detect_sign(small_img, original_image=cv_image, scale=scale)
+
             if detected_sign:
                 frames_since_last = self.frame_count - self.last_detection_frame
                 base_sign_type = detected_sign.split('_')[0]

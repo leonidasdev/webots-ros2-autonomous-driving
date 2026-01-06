@@ -101,7 +101,7 @@ def create_augmented_templates(input_dir=None, max_per_image=20, seed_val=42):
 
     # Scales produced for each canonical copy. Values >1.0 are zoomed-in
     # (larger) templates; values <1.0 are zoomed-out (smaller) templates.
-    output_scales = [1.0, 1.1, 1.2, 1.3, 0.9]
+    output_scales = [1.0, 0.9, 0.8, 0.7, 0.6, 0.55]
 
     for fname in originals:
         path = os.path.join(input_dir, fname)
