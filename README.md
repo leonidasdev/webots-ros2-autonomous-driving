@@ -1,4 +1,4 @@
-# webots-ros2-autonomous-driving
+# Webots ROS2 Autonomous Driving
 
 Compact demonstration stack combining Webots and ROS 2 for lane-following
 and sign-aware longitudinal control. Useful as a reproducible research
