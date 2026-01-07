@@ -69,11 +69,11 @@ class RoadFollower(Node):
         self.no_line_persist_counter = 0
         # Number of consecutive frames to reuse last confident center
         # before attempting fresh recovery. At ~30 FPS, 15 frames ≈ 0.5 s.
-        self.no_line_persist_max = 30
+        self.no_line_persist_max = 35
 
         # PID tuning (operates on pixel error). Values were chosen to be
         # conservative for the simulator; tune as needed in-sim.
-        self.Kp = 0.012
+        self.Kp = 0.008
         self.Ki = 0.000001
         self.Kd = 0.0005
 
@@ -90,6 +90,15 @@ class RoadFollower(Node):
         # Track previous detection confidence to reset controller state on
         # transitions from confident -> unconfident views.
         self.prev_confidence = True
+        # Subscribe to commanded speed to detect braking state. When the
+        # controller publishes a negative `/control/speed` we consider the
+        # vehicle to be actively braking and allow stronger steering
+        # corrections to aid maneuvering before intersections.
+        self.is_braking = False
+        self.braking_steer_gain = 1.5
+        # Allow a larger absolute steering when braking (scale of max_steering)
+        self.braking_max_factor = 1.5
+        self.speed_sub = self.create_subscription(Float32, '/control/speed', self.speed_callback, 10)
 
     def image_callback(self, msg):
         """Handle incoming camera frames, detect road center, and publish steering.
@@ -134,6 +143,21 @@ class RoadFollower(Node):
 
         except Exception as e:
             self.get_logger().error(f"Error processing image: {e}")
+
+    def speed_callback(self, msg):
+        """Monitor `/control/speed` to determine if the vehicle is braking.
+
+        Args:
+            msg (std_msgs.msg.Float32): Commanded speed published by the
+                high-level controller. Negative values are interpreted as
+                active braking requests.
+        """
+        try:
+            v = float(msg.data)
+            # Consider brief negative commands as braking (tolerance to small noise)
+            self.is_braking = (v < -0.01)
+        except Exception:
+            self.is_braking = False
 
     def follow_road(self, image):
         """Top-level detection pipeline: classify scene and detect center.
@@ -360,6 +384,14 @@ class RoadFollower(Node):
         # the actuator command neutral while preserving internal state.
         if not confidence:
             steering = 0.0
+
+        # If the vehicle is braking (negative commanded speed) allow more
+        # aggressive steering by scaling the computed command while capping
+        # the absolute value to a larger braking-specific limit.
+        if getattr(self, 'is_braking', False):
+            steering = steering * float(self.braking_steer_gain)
+            braking_cap = float(self.max_steering) * float(self.braking_max_factor)
+            steering = max(-braking_cap, min(braking_cap, steering))
 
         # Update controller state for the next iteration
         self.prev_error = filtered_error
