@@ -69,13 +69,13 @@ class RoadFollower(Node):
         self.no_line_persist_counter = 0
         # Number of consecutive frames to reuse last confident center
         # before attempting fresh recovery. At ~30 FPS, 15 frames ≈ 0.5 s.
-        self.no_line_persist_max = 15
+        self.no_line_persist_max = 30
 
         # PID tuning (operates on pixel error). Values were chosen to be
         # conservative for the simulator; tune as needed in-sim.
-        self.Kp = 0.005
+        self.Kp = 0.012
         self.Ki = 0.000001
-        self.Kd = 0.0002
+        self.Kd = 0.0005
 
         # Controller state
         self.integral = 0.0
