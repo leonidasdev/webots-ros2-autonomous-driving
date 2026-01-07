@@ -54,14 +54,28 @@ Notes:
 
 
 ## What's in the package
-- `car_pkg/car_pkg/webots_bridge.py` — Bridge node: publishes
-	`/car_camera/image`, `/road_camera/image`, `/clock`, and `/odom`; subscribes
-	to `/control/speed` and `/control/steering`.
-- `car_pkg/car_pkg/road_follower.py` — Lane detection and `steering` publishing.
-- `car_pkg/car_pkg/sign_detector.py` — Template-matching sign detector publishing
-	`/traffic_sign` tokens (e.g., `stop`, `yield`, `speed_limit_50`).
-- `car_pkg/car_pkg/car_controller.py` — High-level logic: subscribes to
-	`/traffic_sign`, `/clock`, `/odom` and publishes `/control/speed` commands.
+- `car_pkg/car_pkg/webots_bridge.py` — Bridge node that maps Webots devices
+	to ROS2 topics and applies incoming control commands.
+	- Publishes: `/car_camera/image` (sensor_msgs/Image), `/road_camera/image` (sensor_msgs/Image),
+		`/clock` (rosgraph_msgs/Clock), `/odom` (nav_msgs/Odometry).
+	- Subscribes: `/control/speed` (std_msgs/Float32), `/control/steering` (std_msgs/Float32).
+
+- `car_pkg/car_pkg/road_follower.py` — Lane detection and lateral controller.
+	- Publishes: `/control/steering` (std_msgs/Float32).
+	- Subscribes: `/road_camera/image` (sensor_msgs/Image), `/control/speed` (std_msgs/Float32).
+		The `/control/speed` subscription is used to detect braking requests so
+		the lateral controller can temporarily allow stronger steering
+		corrections when the vehicle is actively braking.
+
+- `car_pkg/car_pkg/sign_detector.py` — Template-matching sign detector.
+	- Publishes: `/traffic_sign` (std_msgs/String) with tokens like `stop`, `yield`, `speed_limit_50`.
+	- Subscribes: `/car_camera/image` (sensor_msgs/Image).
+
+- `car_pkg/car_pkg/car_controller.py` — High-level longitudinal controller.
+	- Publishes: `/control/speed` (std_msgs/Float32) — commanded forward/reverse speed.
+	- Subscribes: `/traffic_sign` (std_msgs/String), `/clock` (rosgraph_msgs/Clock),
+		`/odom` (nav_msgs/Odometry) used to detect physical stop and coordinate STOP timing.
+
 - `scripts/create_augmented.py` — Utility to generate `_aug_...` and scaled
 	template files in `resources/` for deterministic template matching.
 

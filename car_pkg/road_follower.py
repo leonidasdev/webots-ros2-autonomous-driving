@@ -15,6 +15,10 @@ Publishes:
 
 Subscribes:
     /road_camera/image (sensor_msgs/Image): Camera frames used for lane detection.
+    /control/speed (std_msgs/Float32): Commanded longitudinal speed from the
+        high-level controller. Negative values are interpreted as active
+        braking requests and are used by the node to temporarily allow
+        stronger steering corrections while braking.
 """
 
 import rclpy
@@ -145,12 +149,30 @@ class RoadFollower(Node):
             self.get_logger().error(f"Error processing image: {e}")
 
     def speed_callback(self, msg):
-        """Monitor `/control/speed` to determine if the vehicle is braking.
+        """Update braking state from the high-level `/control/speed` topic.
+
+        Description:
+            This callback observes the commanded longitudinal speed coming
+            from the high-level controller. It sets `self.is_braking` when
+            the command indicates an active braking request (negative
+            commanded speed). A small tolerance is applied to avoid
+            treating sensor or quantization noise as a braking event.
 
         Args:
-            msg (std_msgs.msg.Float32): Commanded speed published by the
-                high-level controller. Negative values are interpreted as
-                active braking requests.
+            msg (std_msgs.msg.Float32): The desired longitudinal speed
+                published by the controller. Convention in this project is
+                that negative values request active braking (reverse or
+                braking action), zero is neutral, and positive values are
+                forward motion.
+
+        Side effects:
+            - Sets `self.is_braking` (bool) to True when `msg.data < -0.01`,
+              otherwise False.
+
+        Notes:
+            - The numeric threshold (`-0.01`) is intentionally small to
+              filter out tiny fluctuations; consider exposing it as a
+              configurable parameter if tuning is needed.
         """
         try:
             v = float(msg.data)
